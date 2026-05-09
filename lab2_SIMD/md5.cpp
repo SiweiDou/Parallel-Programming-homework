@@ -2,6 +2,8 @@
 #include <iomanip>
 #include <assert.h>
 #include <chrono>
+#include <cstdint>
+#include <arm_neon.h>
 
 using namespace std;
 using namespace chrono;
@@ -73,6 +75,34 @@ Byte *StringProcess(string input, int *n_byte)
 	return paddedMessage;
 }
 
+// 使用对SIMD友好的接口，对StringProcess进行了改良
+// 原先的StringProcess逻辑地址不连续，简单地将input变成数组形式无法进行加速，需要利用simd指令
+// input_arry[8]：输入数组，存 8 个原始口令。
+// alignas(32) uint8_t padded_blocks[8][64]：输出数组。
+// alignas(32)保证变量的起始地址为32倍数
+void StringProcess_SIMD(const string input_arry[4], uint8_t padded_blocks[4][64])
+{
+    for(int i = 0; i < 4; ++i)
+    {
+        const string& str = input_arry[i];
+        int len = str.length();
+        
+        // 复制原始数据
+        memcpy(padded_blocks[i], str.c_str(), len);
+        
+        // 填充 0x80
+        padded_blocks[i][len] = 0x80;
+        
+        // 填充 0
+        memset(padded_blocks[i] + len + 1, 0, 56 - len - 1);
+        
+        // 添加 64 位原始长度
+        uint64_t bit_len = len * 8ULL;
+        for(int k = 0; k < 8; ++k) {
+            padded_blocks[i][56 + k] = (bit_len >> (k * 8)) & 0xFF;
+        }
+    }
+}
 
 /**
  * MD5Hash: 将单个输入字符串转换成MD5
@@ -217,3 +247,140 @@ void MD5Hash(string input, bit32 *state)
 	delete[] messageLength;
 }
 
+void MD5HashBatch(const string input_arry[4], bit32 state_batch[4][4])
+{
+	// cout<<"successfully come into MD5HashBatch" << endl;
+	// 声明对齐的连续内存块（4 个口令，每个块固定 64 字节）,匹配SIMD版本的字符串预处理
+	alignas(16) uint8_t padded_blocks[4][64];
+	StringProcess_SIMD(input_arry, padded_blocks);
+	// 保证所有的所有口令长度小于等于 55 字节，填充后每个块都是 64 字节（1 个块）
+	const int n_blocks = 1;
+
+	// 进行字节块拆分，得益于在StringProcess_SIMD中的预处理，我们不需要手动组合字节
+	// 构造16个SIMD向量
+	uint32x4_t x[16];
+	alignas(16) uint32_t vals[4];	// 对应传入的4个字符串（口令）
+	for (int i = 0; i < 16; i++){
+		for(int j = 0; j < 4; j++){
+			vals[j] = *((uint32_t*)(padded_blocks[j] + 4 * i));
+		}
+		x[i] = vld1q_u32(vals);
+	}
+
+	 // 初始化 8 路 MD5 的 a, b, c, d 状态（使用 vdupq_n_u32）
+    uint32x4_t a = vdupq_n_u32(0x67452301);
+    uint32x4_t b = vdupq_n_u32(0xefcdab89);
+    uint32x4_t c = vdupq_n_u32(0x98badcfe);
+    uint32x4_t d = vdupq_n_u32(0x10325476);
+
+	// 更新state，用SIMD函数代替普通运算
+	auto start = system_clock::now();
+
+	// 使用重载版本
+	/* Round 1 */
+	FF(a, b, c, d, x[0], s11, vdupq_n_u32(0xd76aa478));
+	FF(d, a, b, c, x[1], s12, vdupq_n_u32(0xe8c7b756));
+	FF(c, d, a, b, x[2], s13, vdupq_n_u32(0x242070db));
+	FF(b, c, d, a, x[3], s14, vdupq_n_u32(0xc1bdceee));
+	FF(a, b, c, d, x[4], s11, vdupq_n_u32(0xf57c0faf));
+	FF(d, a, b, c, x[5], s12, vdupq_n_u32(0x4787c62a));
+	FF(c, d, a, b, x[6], s13, vdupq_n_u32(0xa8304613));
+	FF(b, c, d, a, x[7], s14, vdupq_n_u32(0xfd469501));
+	FF(a, b, c, d, x[8], s11, vdupq_n_u32(0x698098d8));
+	FF(d, a, b, c, x[9], s12, vdupq_n_u32(0x8b44f7af));
+	FF(c, d, a, b, x[10], s13, vdupq_n_u32(0xffff5bb1));
+	FF(b, c, d, a, x[11], s14, vdupq_n_u32(0x895cd7be));
+	FF(a, b, c, d, x[12], s11, vdupq_n_u32(0x6b901122));
+	FF(d, a, b, c, x[13], s12, vdupq_n_u32(0xfd987193));
+	FF(c, d, a, b, x[14], s13, vdupq_n_u32(0xa679438e));
+	FF(b, c, d, a, x[15], s14, vdupq_n_u32(0x49b40821));
+
+	/* Round 2 */
+	GG(a, b, c, d, x[1], s21, vdupq_n_u32(0xf61e2562));
+	GG(d, a, b, c, x[6], s22, vdupq_n_u32(0xc040b340));
+	GG(c, d, a, b, x[11], s23, vdupq_n_u32(0x265e5a51));
+	GG(b, c, d, a, x[0], s24, vdupq_n_u32(0xe9b6c7aa));
+	GG(a, b, c, d, x[5], s21, vdupq_n_u32(0xd62f105d));
+	GG(d, a, b, c, x[10], s22, vdupq_n_u32(0x2441453));
+	GG(c, d, a, b, x[15], s23, vdupq_n_u32(0xd8a1e681));
+	GG(b, c, d, a, x[4], s24, vdupq_n_u32(0xe7d3fbc8));
+	GG(a, b, c, d, x[9], s21, vdupq_n_u32(0x21e1cde6));
+	GG(d, a, b, c, x[14], s22, vdupq_n_u32(0xc33707d6));
+	GG(c, d, a, b, x[3], s23, vdupq_n_u32(0xf4d50d87));
+	GG(b, c, d, a, x[8], s24, vdupq_n_u32(0x455a14ed));
+	GG(a, b, c, d, x[13], s21, vdupq_n_u32(0xa9e3e905));
+	GG(d, a, b, c, x[2], s22, vdupq_n_u32(0xfcefa3f8));
+	GG(c, d, a, b, x[7], s23, vdupq_n_u32(0x676f02d9));
+	GG(b, c, d, a, x[12], s24, vdupq_n_u32(0x8d2a4c8a));
+
+	/* Round 3 */
+	HH(a, b, c, d, x[5], s31, vdupq_n_u32(0xfffa3942));
+	HH(d, a, b, c, x[8], s32, vdupq_n_u32(0x8771f681));
+	HH(c, d, a, b, x[11], s33, vdupq_n_u32(0x6d9d6122));
+	HH(b, c, d, a, x[14], s34, vdupq_n_u32(0xfde5380c));
+	HH(a, b, c, d, x[1], s31, vdupq_n_u32(0xa4beea44));
+	HH(d, a, b, c, x[4], s32, vdupq_n_u32(0x4bdecfa9));
+	HH(c, d, a, b, x[7], s33, vdupq_n_u32(0xf6bb4b60));
+	HH(b, c, d, a, x[10], s34, vdupq_n_u32(0xbebfbc70));
+	HH(a, b, c, d, x[13], s31, vdupq_n_u32(0x289b7ec6));
+	HH(d, a, b, c, x[0], s32, vdupq_n_u32(0xeaa127fa));
+	HH(c, d, a, b, x[3], s33, vdupq_n_u32(0xd4ef3085));
+	HH(b, c, d, a, x[6], s34, vdupq_n_u32(0x4881d05));
+	HH(a, b, c, d, x[9], s31, vdupq_n_u32(0xd9d4d039));
+	HH(d, a, b, c, x[12], s32, vdupq_n_u32(0xe6db99e5));
+	HH(c, d, a, b, x[15], s33, vdupq_n_u32(0x1fa27cf8));
+	HH(b, c, d, a, x[2], s34, vdupq_n_u32(0xc4ac5665));
+
+	/* Round 4 */
+	II(a, b, c, d, x[0], s41, vdupq_n_u32(0xf4292244));
+	II(d, a, b, c, x[7], s42, vdupq_n_u32(0x432aff97));
+	II(c, d, a, b, x[14], s43, vdupq_n_u32(0xab9423a7));
+	II(b, c, d, a, x[5], s44, vdupq_n_u32(0xfc93a039));
+	II(a, b, c, d, x[12], s41, vdupq_n_u32(0x655b59c3));
+	II(d, a, b, c, x[3], s42, vdupq_n_u32(0x8f0ccc92));
+	II(c, d, a, b, x[10], s43, vdupq_n_u32(0xffeff47d));
+	II(b, c, d, a, x[1], s44, vdupq_n_u32(0x85845dd1));
+	II(a, b, c, d, x[8], s41, vdupq_n_u32(0x6fa87e4f));
+	II(d, a, b, c, x[15], s42, vdupq_n_u32(0xfe2ce6e0));
+	II(c, d, a, b, x[6], s43, vdupq_n_u32(0xa3014314));
+	II(b, c, d, a, x[13], s44, vdupq_n_u32(0x4e0811a1));
+	II(a, b, c, d, x[4], s41, vdupq_n_u32(0xf7537e82));
+	II(d, a, b, c, x[11], s42, vdupq_n_u32(0xbd3af235));
+	II(c, d, a, b, x[2], s43, vdupq_n_u32(0x2ad7d2bb));
+	II(b, c, d, a, x[9], s44, vdupq_n_u32(0xeb86d391));
+
+	// 处理state
+	alignas(16) uint32_t a_vals[4];
+	vst1q_u32(a_vals, a);
+
+	// a_vals[]中存储了8个口令的a值，其他三个值同理，可以用下标访问
+	for (int k = 0; k < 4; ++k) {
+		uint32_t val = a_vals[k];
+		val = ((val & 0xff) << 24) | ((val & 0xff00) << 8) | ((val & 0xff0000) >> 8) | ((val & 0xff000000) >> 24);
+		state_batch[k][0] = val;
+	}
+	alignas(16) uint32_t b_vals[4];
+	vst1q_u32(b_vals, b);
+
+	for (int k = 0; k < 4; ++k) {
+		uint32_t val = b_vals[k];
+		val = ((val & 0xff) << 24) | ((val & 0xff00) << 8) | ((val & 0xff0000) >> 8) | ((val & 0xff000000) >> 24);
+		state_batch[k][1] = val;
+	}
+	alignas(16) uint32_t c_vals[4];
+	vst1q_u32(c_vals, c);
+
+	for (int k = 0; k < 4; ++k) {
+		uint32_t val = c_vals[k];
+		val = ((val & 0xff) << 24) | ((val & 0xff00) << 8) | ((val & 0xff0000) >> 8) | ((val & 0xff000000) >> 24);
+		state_batch[k][2] = val;
+	}
+	alignas(16) uint32_t d_vals[4];
+	vst1q_u32(d_vals, d);
+
+	for (int k = 0; k < 4; ++k) {
+		uint32_t val = d_vals[k];
+		val = ((val & 0xff) << 24) | ((val & 0xff00) << 8) | ((val & 0xff0000) >> 8) | ((val & 0xff000000) >> 24);
+		state_batch[k][3] = val;
+	}
+}

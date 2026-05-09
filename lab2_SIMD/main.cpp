@@ -4,6 +4,7 @@
 #include <sstream>
 #include "md5.h"
 #include <iomanip>
+#include <ctime>
 using namespace std;
 using namespace chrono;
 
@@ -13,7 +14,12 @@ using namespace chrono;
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2
 
 int main()
-{
+{ 
+    //打印运行时间戳
+    time_t now = time(0);
+    char* dt = ctime(&now);
+    cout << "Test started at: " << dt;
+    cout << "test test test test test" << endl;
     //下面代码用于测试MD5哈希的正确性
     cout << "Testing MD5Hash correctness..." << endl;
     string test_pws[8] = {"123456", "password", "12345678", "qwerty", "123456789", "12345", "1234", "111111"};
@@ -66,7 +72,7 @@ int main()
         q.total_guesses = q.guesses.size();
         if (q.total_guesses - curr_num >= 100000)
         {
-            cout << "Guesses generated: " <<history + q.total_guesses << endl;
+            // cout << "Guesses generated: " <<history + q.total_guesses << endl;
             curr_num = q.total_guesses;
 
             // 在此处更改实验生成的猜测上限
@@ -84,22 +90,29 @@ int main()
         }
         // 为了避免内存超限，我们在q.guesses中口令达到一定数目时，将其中的所有口令取出并且进行哈希
         // 然后，q.guesses将会被清空。为了有效记录已经生成的口令总数，维护一个history变量来进行记录
-        if (curr_num > 1000000)
+        // if (q.guesses.size() >= 8) 发现性能没有提升，可能是条件过于苛刻，导致没有进入分支，我们修改进入分支的条件，只要基类够8个就执行
+        if (curr_num > 500000) 
         {
             auto start_hash = system_clock::now();
-            bit32 state[4];
-            for (string pw : q.guesses)
+            bit32 state_batch[4][4];
+            int count = 0;
+            string input_arry[4];
+            for(string pw : q.guesses)
             {
-                // TODO：对于SIMD实验，将这里替换成你的SIMD MD5函数
-                MD5Hash(pw, state);
-
-                // 以下注释部分用于输出猜测和哈希，但是由于自动测试系统不太能写文件，所以这里你可以改成cout
-                // a<<pw<<"\t";
-                // for (int i1 = 0; i1 < 4; i1 += 1)
-                // {
-                //     a << std::setw(8) << std::setfill('0') << hex << state[i1];
-                // }
-                // a << endl;
+                input_arry[count++] = pw;
+                if (count == 4){
+                    MD5HashBatch(input_arry, state_batch);
+                    count = 0;
+                }
+            }
+            // 处理剩余不足4个的口令（用标量版本完成）
+            if (count > 0)
+            {
+                for (int i = 0; i < count; ++i)
+                {
+                    bit32 state[4];
+                    MD5Hash(input_arry[i], state); // 调用原始的标量 MD5Hash
+                }
             }
 
             // 在这里对哈希所需的总时长进行计算
