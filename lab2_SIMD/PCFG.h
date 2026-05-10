@@ -2,7 +2,6 @@
 #include <iostream>
 #include <unordered_map>
 #include <queue>
-#include <omp.h>
 // #include <chrono>   
 // using namespace chrono;
 using namespace std;
@@ -159,4 +158,11 @@ public:
     void PopNext();
     int total_guesses = 0;
     vector<string> guesses;
+
+    vector<vector<string>> local_guesses;   // 新增成员,在Generate中使用，用于将segment赋值操作拆成多线程
+    vector<int> local_counts;               // 新增成员，同上
+    PriorityQueue() {
+        local_guesses.resize(omp_get_max_threads());
+        local_counts.resize(omp_get_max_threads(), 0);
+    }
 };

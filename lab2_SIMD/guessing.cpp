@@ -1,4 +1,5 @@
 #include "PCFG.h"
+#include <omp.h>
 using namespace std;
 
 void PriorityQueue::CalProb(PT &pt)
@@ -181,6 +182,12 @@ vector<PT> PT::NewPTs()
 // 尽量看懂，然后进行并行实现
 void PriorityQueue::Generate(PT pt)
 {
+    // 给每个线程的缓存清空，在并行逻辑中会用到local_guesses和local_counts
+    for (int t = 0; t < num_threads; ++t) {
+        local_guesses[t].clear();
+        local_counts[t] = 0;
+    }
+    
     // 计算PT的概率，这里主要是给PT的概率进行初始化
     CalProb(pt);
 
@@ -207,12 +214,51 @@ void PriorityQueue::Generate(PT pt)
         // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
         // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
         // 这个过程是可以高度并行化的
-        for (int i = 0; i < pt.max_indices[0]; i += 1)
+        // for (int i = 0; i < pt.max_indices[0]; i += 1)
+        // {
+        //     string guess = a->ordered_values[i];
+        //     // cout << guess << endl;
+        //     guesses.emplace_back(guess);
+        //     total_guesses += 1;
+        // }
+
+        // 我们分配多个线程同时对segment中的value进行赋值操作，
+        // 将每个线程的结果先独立存储在猜测缓存中，最后再合并
+        int total = pt.max_indices[0];
+        // 如果总数很小，直接用串行版本，避免多线程开销
+        if (total < 500) {
+            for (int i = 0; i < total; ++i) {
+                guesses.emplace_back(a->ordered_values[i]); // 直接添加，不用 guess + ...
+                total_guesses += 1;
+            }
+            return;
+        }
+
+        // 并行版本：手动分块
+        int num_threads = omp_get_max_threads();
+        vector<vector<string>> local_guesses(num_threads);
+        vector<int> local_counts(num_threads, 0);
+
+        #pragma omp parallel
         {
-            string guess = a->ordered_values[i];
-            // cout << guess << endl;
-            guesses.emplace_back(guess);
-            total_guesses += 1;
+            int tid = omp_get_thread_num();
+            int num_threads_actual = omp_get_num_threads();
+            int chunk_size = total / num_threads_actual;
+            int start = tid * chunk_size;
+            int end = (tid == num_threads_actual - 1) ? total : start + chunk_size;
+
+            for (int i = start; i < end; ++i) {
+                // 注意：这里直接用 a->ordered_values[i]，不需要猜前缀
+                string temp = a->ordered_values[i];
+                local_guesses[tid].emplace_back(temp);
+                local_counts[tid] += 1;
+            }
+        }
+
+        // 合并
+        for (int t = 0; t < num_threads; ++t) {
+            guesses.insert(guesses.end(), local_guesses[t].begin(), local_guesses[t].end());
+            total_guesses += local_counts[t];
         }
     }
     else
@@ -262,12 +308,50 @@ void PriorityQueue::Generate(PT pt)
         // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
         // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
         // 这个过程是可以高度并行化的
-        for (int i = 0; i < pt.max_indices[pt.content.size() - 1]; i += 1)
+        // for (int i = 0; i < pt.max_indices[pt.content.size() - 1]; i += 1)
+        // {
+        //     string temp = guess + a->ordered_values[i];
+        //     // cout << temp << endl;
+        //     guesses.emplace_back(temp);
+        //     total_guesses += 1;
+        // }
+        int num_threads = omp_get_max_threads();
+        vector<vector<string>> local_guesses(num_threads);
+        vector<int> local_counts(num_threads, 0);
+
+        // 总工作量
+        int total = pt.max_indices[pt.content.size() - 1];
+
+        // 如果总猜测数很小，直接串行处理，避免多线程开销
+        if (total < 500) {
+            for (int i = 0; i < total; ++i) {
+                string temp = guess + a->ordered_values[i];
+                guesses.emplace_back(temp);
+                total_guesses += 1;
+            }
+            return;
+        }
+
+        // 并行处理
+        #pragma omp parallel
         {
-            string temp = guess + a->ordered_values[i];
-            // cout << temp << endl;
-            guesses.emplace_back(temp);
-            total_guesses += 1;
+            int tid = omp_get_thread_num();
+            int num_threads_actual = omp_get_num_threads();  // 实际参与并行的线程数（在并行区内调用）
+            int chunk_size = total / num_threads_actual;
+            int start = tid * chunk_size;
+            int end = (tid == num_threads_actual - 1) ? total : start + chunk_size;
+
+            for (int i = start; i < end; ++i) {
+                string temp = guess + a->ordered_values[i];
+                local_guesses[tid].emplace_back(temp);
+                local_counts[tid] += 1;
+            }
+        }
+
+        // 合并所有线程的结果
+        for (int t = 0; t < num_threads; ++t) {
+            guesses.insert(guesses.end(), local_guesses[t].begin(), local_guesses[t].end());
+            total_guesses += local_counts[t];
         }
     }
 }
