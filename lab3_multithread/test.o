@@ -1,0 +1,16 @@
+Test started at: Wed May 27 20:55:18 2026
+Testing MD5Hash correctness...
+MD5Hash test passed!
+Training...
+Training phase 1: reading and parsing passwords...
+Training phase 2: Ordering segment values and PTs...
+total pts18966
+Ordering letters
+Ordering digits
+ordering symbols
+here
+Guess time:0.54174seconds
+Hash time:1.58417seconds
+Train time:25.0102seconds
+
+Authorized users only. All activities may be monitored and reported.

@@ -1,0 +1,12 @@
+Hash time:3.26656seconds
+Hash time:3.20168seconds
+Hash time:3.44811seconds
+Hash time:1.6701seconds
+Hash time:1.7327seconds
+Hash time:1.63488seconds
+Hash time:3.48946seconds
+Hash time:3.45173seconds
+Hash time:3.46481seconds
+Hash time:1.49061seconds
+Hash time:1.55156seconds
+Hash time:1.60015seconds
