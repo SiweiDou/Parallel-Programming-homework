@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <queue>
 #include <pthread.h>
+#include <mutex>
 // #include <chrono>   
 // using namespace chrono;
 
@@ -141,10 +142,24 @@ public:
 
 };
 
+struct GenerateArg {
+    int thread_id;
+    int start;          // 起始下标（包含）
+    int end;            // 结束下标（不包含）
+    string prefix = string(); // 原名guess
+    segment* seg_ptr;        // 输入数组
+    
+};
+
+struct TreadResult {
+    vector<string> local_result;
+    int local_guesses = 0;
+};
+
 // 优先队列，用于按照概率降序生成口令猜测
 // 实际上，这个class负责队列维护、口令生成、结果存储的全部过程
 class PriorityQueue
-{
+{  
 public:
     // 用vector实现的priority queue
     vector<PT> priority;
@@ -166,23 +181,40 @@ public:
     int total_guesses = 0;
     vector<string> guesses;
 
-};
+    pthread_t threads[NUM_THREADS - 1];
+    // 任务队列相关
+    pthread_mutex_t task_mutex;
+    pthread_cond_t task_cond;
+    // 完成计数相关
+    pthread_mutex_t done_mutex;
+    pthread_cond_t done_cond;
+    queue<GenerateArg> task_queue;
+    TreadResult results[NUM_THREADS - 1];
+    bool all_done = false;
+    int tasks_remaining = 0;
 
-struct GenerateArg {
-    int local_geusses = 0;
-    int start;          // 起始下标（包含）
-    int end;            // 结束下标（不包含）
-    string guess = string();
-    segment* seg_ptr;        // 输入数组
-    vector<string> local_result;     // 输出数组
-};
+    // 启动线程池
+    void start_thread_pool();
 
-inline void* guess_generate_worker(void* arg) {
-    GenerateArg* ga = (GenerateArg*)arg;
-    for (int i = ga->start; i < ga->end; i++){
-        string temp = ga->guess + ga->seg_ptr->ordered_values[i];
-        ga->local_result.emplace_back(temp);
-        ga->local_geusses += 1;
+    // 停止线程池
+    void stop_thread_pool();
+
+    // 提交一批任务并等待完成
+    void parallel_generate(segment* a,string prefix,int thread_id, int start, int end);
+
+    PriorityQueue() {
+        pthread_mutex_init(&task_mutex, NULL);
+        pthread_cond_init(&task_cond, NULL);
+        pthread_mutex_init(&done_mutex, NULL);
+        pthread_cond_init(&done_cond, NULL);
     }
-    return NULL;
-}
+    
+    ~PriorityQueue() {
+        pthread_mutex_destroy(&task_mutex);
+        pthread_cond_destroy(&task_cond);
+        pthread_mutex_destroy(&done_mutex);
+        pthread_cond_destroy(&done_cond);
+    }
+};
+
+inline void* guess_generate_worker(void* arg); 

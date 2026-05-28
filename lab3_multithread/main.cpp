@@ -67,6 +67,9 @@ int main()
     // 由于需要定期清空内存，我们在这里记录已生成的猜测总数
     int history = 0;
     // std::ofstream a("./files/results.txt");
+
+    q.start_thread_pool();
+
     while (!q.priority.empty())
     {
         q.PopNext();
@@ -86,6 +89,9 @@ int main()
                 cout << "Guess time:" << time_guess - time_hash << "seconds"<< endl;//请不要修改这一行
                 cout << "Hash time:" << time_hash << "seconds"<<endl;//请不要修改这一行
                 cout << "Train time:" << time_train <<"seconds"<<endl;//请不要修改这一行
+
+                q.stop_thread_pool();
+
                 break;
             }
         }

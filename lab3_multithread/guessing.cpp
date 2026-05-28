@@ -177,6 +177,91 @@ vector<PT> PT::NewPTs()
     return res;
 }
 
+inline void* guess_generate_worker(void* arg) {
+    PriorityQueue* pq = static_cast<PriorityQueue*>(arg);
+
+    while (true) {
+        // 加锁
+        pthread_mutex_lock(&pq->task_mutex);
+        
+        // 如果还没结束且队列中没有任务，就等待（阻塞）
+        while (pq->task_queue.empty() && !pq->all_done) {
+            pthread_cond_wait(&pq->task_cond, &pq->task_mutex);
+        }
+
+        // 如果所有任务都完成了，退出循环
+        if (pq->task_queue.empty() && pq->all_done) {
+            pthread_mutex_unlock(&pq->task_mutex);
+            break;
+        }
+
+        // 取出任务
+        GenerateArg task = pq->task_queue.front();
+        pq->task_queue.pop();
+        // cout << "线程" <<task.thread_id<<"任务开始"<<endl;
+        pthread_mutex_unlock(&pq->task_mutex);
+
+        // 执行任务
+        for (int i = task.start; i < task.end; i++){
+            string temp = task.prefix + task.seg_ptr->ordered_values[i];
+            pq->results[task.thread_id].local_result.emplace_back(temp);
+            pq->results[task.thread_id].local_guesses += 1;
+        }
+        
+        //报告线程完成
+        pthread_mutex_lock(&pq->done_mutex);
+        pq->tasks_remaining--;
+        // cout << "线程" <<task.thread_id<<"任务结束"<<endl;
+        pthread_cond_signal(&pq->done_cond); // 唤醒主线程
+        pthread_mutex_unlock(&pq->done_mutex);   
+    }
+    // GenerateArg* ga = (GenerateArg*)arg;
+    // for (int i = ga->start; i < ga->end; i++){
+    //     string temp = ga->guess + ga->seg_ptr->ordered_values[i];
+    //     ga->local_result.emplace_back(temp);
+    //     ga->local_geusses += 1;
+    // }
+    return NULL;
+}
+
+void PriorityQueue::start_thread_pool() {
+    for (int i = 0; i < NUM_THREADS - 1; i++){
+        pthread_create(&threads[i], NULL, guess_generate_worker, this);
+    }
+    // cout << "开启线程池"<<endl;
+}
+
+void PriorityQueue::stop_thread_pool() {
+    // 通知所有线程退出
+    pthread_mutex_lock(&task_mutex);
+    all_done = true;
+    pthread_mutex_unlock(&task_mutex);
+    pthread_cond_broadcast(&task_cond);
+    
+    // 等待线程结束
+    for (int i = 0; i < NUM_THREADS - 1; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    // cout << "关闭线程池" << endl;
+}
+
+void PriorityQueue::parallel_generate(segment* a, string prefix, int thread_id, int start, int end) {
+    // 上锁
+    pthread_mutex_lock(&task_mutex);
+    
+    GenerateArg task;
+    task.prefix = prefix;
+    task.seg_ptr = a;
+    task.thread_id = thread_id;
+    task.start = start;
+    task.end = end;
+    task_queue.push(task);
+    // cout<<"parallel_generate完成，新任务入队"<<endl;
+    
+    pthread_mutex_unlock(&task_mutex);
+
+    pthread_cond_signal(&task_cond);
+}
 
 // 这个函数是PCFG并行化算法的主要载体
 // 尽量看懂，然后进行并行实现
@@ -209,30 +294,61 @@ void PriorityQueue::Generate(PT pt)
         // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
         // 这个过程是可以高度并行化的
 
-        // 创建子线程（7个）
-        pthread_t threads[NUM_THREADS - 1];
         int chunk_size = pt.max_indices[0] / NUM_THREADS;
-        GenerateArg args[NUM_THREADS];
-
-        for (int t = 1; t < NUM_THREADS; t++){
-            args[t].start = t * chunk_size;
-            args[t].end = (t == NUM_THREADS - 1) ? pt.max_indices[0] : (t + 1) * chunk_size;
-            args[t].seg_ptr = a;
-            pthread_create(&threads[t-1], NULL, guess_generate_worker, &args[t]);
+        // 子线程分工（0~NUM_THREADS-1 段）
+        tasks_remaining = NUM_THREADS - 1;
+        for (int t = 0; t < NUM_THREADS - 1; t++){
+            parallel_generate(a, string(), t, chunk_size * t, chunk_size * (t+1));
+            // cout << "子线程分工get"<<endl;
         }
-
-        // 主线程处理第0段
-        for (int i = 0; i < chunk_size; i++){
+        // 主线程完成最后一段
+        for (int i = chunk_size * (NUM_THREADS - 1); i < pt.max_indices[0]; i++) {
             guesses.emplace_back(a->ordered_values[i]);
             total_guesses++;
         }
 
-        // 等待子线程并合并结果
-        for (int t = 0; t < 7; t++){
-            pthread_join(threads[t], NULL);
-            for (const string& s : args[t+1].local_result) guesses.emplace_back(s);
-            total_guesses += args[t+1].local_geusses;
+        // 等待子线程
+        pthread_mutex_lock(&done_mutex);
+        while (tasks_remaining > 0) {
+            pthread_cond_wait(&done_cond, &done_mutex); // 等待子线程完成任务
+            // cout << "有一个子线程完成了任务，当前剩余tasks:"<<tasks_remaining<<endl;
         }
+        pthread_mutex_unlock(&done_mutex);
+
+        // 合并结果
+        for (int t = 0; t < NUM_THREADS - 1; t++) {
+            for (const string& s : results[t].local_result) {
+                guesses.emplace_back(s);
+            }
+            total_guesses += results[t].local_guesses;
+            results[t].local_result.clear();
+            results[t].local_guesses = 0;
+        }
+
+        // // 创建子线程（NUM_THREADS-1个）
+        // pthread_t threads[NUM_THREADS - 1];
+        // int chunk_size = pt.max_indices[0] / NUM_THREADS;
+        // GenerateArg args[NUM_THREADS];
+
+        // for (int t = 1; t < NUM_THREADS; t++){
+        //     args[t].start = t * chunk_size;
+        //     args[t].end = (t == NUM_THREADS - 1) ? pt.max_indices[0] : (t + 1) * chunk_size;
+        //     args[t].seg_ptr = a;
+        //     pthread_create(&threads[t-1], NULL, guess_generate_worker, &args[t]);
+        // }
+
+        // // 主线程处理第0段
+        // for (int i = 0; i < chunk_size; i++){
+        //     guesses.emplace_back(a->ordered_values[i]);
+        //     total_guesses++;
+        // }
+
+        // // 等待子线程并合并结果
+        // for (int t = 0; t < 7; t++){
+        //     pthread_join(threads[t], NULL);
+        //     for (const string& s : args[t+1].local_result) guesses.emplace_back(s);
+        //     total_guesses += args[t+1].local_geusses;
+        // }
 
         // for (int i = 0; i < pt.max_indices[0]; i += 1)
         // {
@@ -289,32 +405,63 @@ void PriorityQueue::Generate(PT pt)
         // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
         // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
         // 这个过程是可以高度并行化的
-
-        // 创建子线程（7个）
-        pthread_t threads[NUM_THREADS - 1];
         int chunk_size = pt.max_indices[pt.content.size() - 1] / NUM_THREADS;
-        GenerateArg args[NUM_THREADS];
-
-        for (int t = 1; t < NUM_THREADS; t++){
-            args[t].start = t * chunk_size;
-            args[t].end = (t == NUM_THREADS - 1) ? pt.max_indices[pt.content.size() - 1] : (t + 1) * chunk_size;
-            args[t].seg_ptr = a;
-            args[t].guess = guess;
-            pthread_create(&threads[t-1], NULL, guess_generate_worker, &args[t]);
+        // 子线程分工（0~NUM_THREADS-1 段）
+        tasks_remaining = NUM_THREADS - 1;
+        for (int t = 0; t < NUM_THREADS - 1; t++){
+            parallel_generate(a, guess, t, chunk_size * t, chunk_size * (t+1));
+            // cout << "子线程分工get"<<endl;
         }
-
-        // 主线程处理第0段
-        for (int i = 0; i < chunk_size; i++){
+        
+        // 主线程完成最后一段
+        for (int i = chunk_size * (NUM_THREADS - 1); i < pt.max_indices[pt.content.size() - 1]; i++) {
             guesses.emplace_back(guess + a->ordered_values[i]);
             total_guesses++;
         }
 
-        // 等待子线程并合并结果
-        for (int t = 0; t < 7; t++){
-            pthread_join(threads[t], NULL);
-            for (const string& s : args[t+1].local_result) guesses.emplace_back(s);
-            total_guesses += args[t+1].local_geusses;
+        // 等待子线程
+        pthread_mutex_lock(&done_mutex);
+        while (tasks_remaining > 0) {
+            pthread_cond_wait(&done_cond, &done_mutex); // 等待子线程完成任务
+            // cout << "有一个子线程完成了任务，当前剩余tasks:"<<tasks_remaining<<endl;
         }
+        pthread_mutex_unlock(&done_mutex);
+
+        // 合并结果
+        for (int t = 0; t < NUM_THREADS - 1; t++) {
+            for (const string& s : results[t].local_result) {
+                guesses.emplace_back(s);
+            }
+            total_guesses += results[t].local_guesses;
+            results[t].local_result.clear();
+            results[t].local_guesses = 0;
+        }
+        
+        // // 创建子线程（7个）
+        // pthread_t threads[NUM_THREADS - 1];
+        // int chunk_size = pt.max_indices[pt.content.size() - 1] / NUM_THREADS;
+        // GenerateArg args[NUM_THREADS];
+
+        // for (int t = 1; t < NUM_THREADS; t++){
+        //     args[t].start = t * chunk_size;
+        //     args[t].end = (t == NUM_THREADS - 1) ? pt.max_indices[pt.content.size() - 1] : (t + 1) * chunk_size;
+        //     args[t].seg_ptr = a;
+        //     args[t].guess = guess;
+        //     pthread_create(&threads[t-1], NULL, guess_generate_worker, &args[t]);
+        // }
+
+        // // 主线程处理第0段
+        // for (int i = 0; i < chunk_size; i++){
+        //     guesses.emplace_back(guess + a->ordered_values[i]);
+        //     total_guesses++;
+        // }
+
+        // // 等待子线程并合并结果
+        // for (int t = 0; t < 7; t++){
+        //     pthread_join(threads[t], NULL);
+        //     for (const string& s : args[t+1].local_result) guesses.emplace_back(s);
+        //     total_guesses += args[t+1].local_geusses;
+        // }
 
         // for (int i = 0; i < pt.max_indices[pt.content.size() - 1]; i += 1)
         // {
