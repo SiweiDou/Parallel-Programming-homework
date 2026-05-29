@@ -214,12 +214,6 @@ inline void* guess_generate_worker(void* arg) {
         pthread_cond_signal(&pq->done_cond); // 唤醒主线程
         pthread_mutex_unlock(&pq->done_mutex);   
     }
-    // GenerateArg* ga = (GenerateArg*)arg;
-    // for (int i = ga->start; i < ga->end; i++){
-    //     string temp = ga->guess + ga->seg_ptr->ordered_values[i];
-    //     ga->local_result.emplace_back(temp);
-    //     ga->local_geusses += 1;
-    // }
     return NULL;
 }
 
@@ -242,24 +236,6 @@ void PriorityQueue::stop_thread_pool() {
         pthread_join(threads[i], NULL);
     }
     // cout << "关闭线程池" << endl;
-}
-
-void PriorityQueue::parallel_generate(segment* a, string prefix, int thread_id, int start, int end) {
-    // 上锁
-    pthread_mutex_lock(&task_mutex);
-    
-    GenerateArg task;
-    task.prefix = prefix;
-    task.seg_ptr = a;
-    task.thread_id = thread_id;
-    task.start = start;
-    task.end = end;
-    task_queue.push(task);
-    // cout<<"parallel_generate完成，新任务入队"<<endl;
-    
-    pthread_mutex_unlock(&task_mutex);
-
-    pthread_cond_signal(&task_cond);
 }
 
 // 这个函数是PCFG并行化算法的主要载体
@@ -317,10 +293,7 @@ void PriorityQueue::Generate(PT pt)
             }
             pthread_mutex_unlock(&task_mutex);
             pthread_cond_broadcast(&task_cond); // 唤醒所有线程
-            // for (int t = 0; t < NUM_THREADS - 1; t++){
-            //     parallel_generate(a, string(), t, chunk_size * t, chunk_size * (t+1));
-            //     // cout << "子线程分工get"<<endl;
-            // }
+    
             // 主线程完成最后一段
             for (int i = chunk_size * (NUM_THREADS - 1); i < total_items; i++) {
                 guesses[old_size + i] = a->ordered_values[i];
@@ -334,14 +307,6 @@ void PriorityQueue::Generate(PT pt)
             }
             pthread_mutex_unlock(&done_mutex);
 
-            // 合并结果
-            // for (int t = 0; t < NUM_THREADS - 1; t++) {
-            //     for (const string& s : results[t].local_result) {
-            //         guesses.emplace_back(s);
-            //     }
-            //     results[t].local_result.clear();
-            //     results[t].local_guesses = 0;
-            // }
         } else {
             // serial_count+=1;
             for (int i = 0; i < total_items; i += 1)
@@ -349,40 +314,6 @@ void PriorityQueue::Generate(PT pt)
                 guesses[old_size + i] = a->ordered_values[i];
             }
         }
-        
-
-        // // 创建子线程（NUM_THREADS-1个）
-        // pthread_t threads[NUM_THREADS - 1];
-        // int chunk_size = pt.max_indices[0] / NUM_THREADS;
-        // GenerateArg args[NUM_THREADS];
-
-        // for (int t = 1; t < NUM_THREADS; t++){
-        //     args[t].start = t * chunk_size;
-        //     args[t].end = (t == NUM_THREADS - 1) ? pt.max_indices[0] : (t + 1) * chunk_size;
-        //     args[t].seg_ptr = a;
-        //     pthread_create(&threads[t-1], NULL, guess_generate_worker, &args[t]);
-        // }
-
-        // // 主线程处理第0段
-        // for (int i = 0; i < chunk_size; i++){
-        //     guesses.emplace_back(a->ordered_values[i]);
-        //     total_guesses++;
-        // }
-
-        // // 等待子线程并合并结果
-        // for (int t = 0; t < 7; t++){
-        //     pthread_join(threads[t], NULL);
-        //     for (const string& s : args[t+1].local_result) guesses.emplace_back(s);
-        //     total_guesses += args[t+1].local_geusses;
-        // }
-
-        // for (int i = 0; i < pt.max_indices[0]; i += 1)
-        // {
-        //     string guess = a->ordered_values[i];
-        //     // cout << guess << endl;
-        //     guesses.emplace_back(guess);
-        //     total_guesses += 1;
-        // }
     }
     else
     {
@@ -456,12 +387,7 @@ void PriorityQueue::Generate(PT pt)
             }
             pthread_mutex_unlock(&task_mutex);
             pthread_cond_broadcast(&task_cond); // 唤醒所有线程
-            // tasks_remaining = NUM_THREADS - 1;
-            // for (int t = 0; t < NUM_THREADS - 1; t++){
-            //     parallel_generate(a, guess, t, chunk_size * t, chunk_size * (t+1));
-            //     // cout << "子线程分工get"<<endl;
-            // }
-            
+          
             // 主线程完成最后一段
             for (int i = chunk_size * (NUM_THREADS - 1); i < total_items; i++) {
                 guesses[old_size + i] = guess + a->ordered_values[i];
@@ -474,15 +400,6 @@ void PriorityQueue::Generate(PT pt)
                 // cout << "有一个子线程完成了任务，当前剩余tasks:"<<tasks_remaining<<endl;
             }
             pthread_mutex_unlock(&done_mutex);
-
-            // 合并结果
-            // for (int t = 0; t < NUM_THREADS - 1; t++) {
-            //     for (const string& s : results[t].local_result) {
-            //         guesses.emplace_back(s);
-            //     }
-            //     results[t].local_result.clear();
-            //     results[t].local_guesses = 0;
-            // }
         } else {
             // serial_count+=1;
             for (int i = 0; i < total_items; i += 1)
@@ -490,50 +407,5 @@ void PriorityQueue::Generate(PT pt)
                 guesses[old_size + i] = guess + a->ordered_values[i];
             }
         }
-        
-        
-        // // 创建子线程（7个）
-        // pthread_t threads[NUM_THREADS - 1];
-        // int chunk_size = pt.max_indices[pt.content.size() - 1] / NUM_THREADS;
-        // GenerateArg args[NUM_THREADS];
-
-        // for (int t = 1; t < NUM_THREADS; t++){
-        //     args[t].start = t * chunk_size;
-        //     args[t].end = (t == NUM_THREADS - 1) ? pt.max_indices[pt.content.size() - 1] : (t + 1) * chunk_size;
-        //     args[t].seg_ptr = a;
-        //     args[t].guess = guess;
-        //     pthread_create(&threads[t-1], NULL, guess_generate_worker, &args[t]);
-        // }
-
-        // // 主线程处理第0段
-        // for (int i = 0; i < chunk_size; i++){
-        //     guesses.emplace_back(guess + a->ordered_values[i]);
-        //     total_guesses++;
-        // }
-
-        // // 等待子线程并合并结果
-        // for (int t = 0; t < 7; t++){
-        //     pthread_join(threads[t], NULL);
-        //     for (const string& s : args[t+1].local_result) guesses.emplace_back(s);
-        //     total_guesses += args[t+1].local_geusses;
-        // }
-
-        // for (int i = 0; i < pt.max_indices[pt.content.size() - 1]; i += 1)
-        // {
-        //     string temp = guess + a->ordered_values[i];
-        //     // cout << temp << endl;
-        //     guesses.emplace_back(temp);
-        //     total_guesses += 1;
-        // }
     }
 }
-
-// void PriorityQueue::PrintChunkSizeStats() {
-//     cout << "\n=== Chunk Size 任务粒度数量级统计 ===" << endl;
-//     cout << "1位数 (0-9): \t\t" << chunk_size_stats[0] << " 次" << endl;
-//     cout << "2位数 (10-99): \t\t" << chunk_size_stats[1] << " 次" << endl;
-//     cout << "3位数 (100-999): \t" << chunk_size_stats[2] << " 次" << endl;
-//     cout << "4位数 (1000-9999): \t" << chunk_size_stats[3] << " 次" << endl;
-//     cout << "5位数及以上 (>=10000): \t" << chunk_size_stats[4] << " 次" << endl;
-//     cout << "=====================================\n" << endl;
-// }

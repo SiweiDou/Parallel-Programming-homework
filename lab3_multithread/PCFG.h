@@ -217,12 +217,6 @@ public:
         pthread_mutex_destroy(&done_mutex);
         pthread_cond_destroy(&done_cond);
     }
-
-    // 用于统计 chunk_size 数量级的数组
-    // 索引对应：[0]: 1位数, [1]: 2位数, [2]: 3位数, [3]: 4位数, [4]: 5位数及以上
-    // long long chunk_size_stats[5] = {0};
-
-    // void PrintChunkSizeStats();
     long long pthread_count = 0,  serial_count = 0;
 };
 
