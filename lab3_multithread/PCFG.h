@@ -4,6 +4,7 @@
 #include <queue>
 #include <pthread.h>
 #include <mutex>
+#include <omp.h>
 // #include <chrono>   
 // using namespace chrono;
 
@@ -146,6 +147,7 @@ struct GenerateArg {
     int thread_id;
     int start;          // 起始下标（包含）
     int end;            // 结束下标（不包含）
+    int old_size;
     string prefix = string(); // 原名guess
     segment* seg_ptr;        // 输入数组
     
@@ -153,7 +155,6 @@ struct GenerateArg {
 
 struct TreadResult {
     vector<string> local_result;
-    int local_guesses = 0;
 };
 
 // 优先队列，用于按照概率降序生成口令猜测
@@ -179,6 +180,7 @@ public:
     // 将优先队列最前面的一个PT
     void PopNext();
     int total_guesses = 0;
+    int old_size = 0;
     vector<string> guesses;
 
     pthread_t threads[NUM_THREADS - 1];
