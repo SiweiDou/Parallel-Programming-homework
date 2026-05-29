@@ -92,6 +92,8 @@ int main()
 
                 q.stop_thread_pool();
 
+                cout << "PriorityQueue::Generate中，进入多线程分支 " << q.pthread_count << "次"<<endl;
+                cout << "进入单线程分支" << q.serial_count << "次"<<endl;
                 break;
             }
         }
