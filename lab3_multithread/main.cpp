@@ -13,6 +13,7 @@ using namespace chrono;
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O1
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2
+// g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2 -fopenmp
 
 int main()
 { 
@@ -68,8 +69,6 @@ int main()
     int history = 0;
     // std::ofstream a("./files/results.txt");
 
-    q.start_thread_pool();
-
     while (!q.priority.empty())
     {
         q.PopNext();
@@ -89,9 +88,6 @@ int main()
                 cout << "Guess time:" << time_guess - time_hash << "seconds"<< endl;//请不要修改这一行
                 cout << "Hash time:" << time_hash << "seconds"<<endl;//请不要修改这一行
                 cout << "Train time:" << time_train <<"seconds"<<endl;//请不要修改这一行
-
-                q.stop_thread_pool();
-
                 // cout << "PriorityQueue::Generate中，进入多线程分支 " << q.pthread_count << "次"<<endl;
                 // cout << "进入单线程分支" << q.serial_count << "次"<<endl;
                 break;

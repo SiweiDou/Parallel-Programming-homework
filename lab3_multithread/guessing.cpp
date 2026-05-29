@@ -1,5 +1,4 @@
 #include "PCFG.h"
-#include <omp.h>
 using namespace std;
 
 void PriorityQueue::CalProb(PT &pt)
@@ -177,67 +176,6 @@ vector<PT> PT::NewPTs()
     return res;
 }
 
-inline void* guess_generate_worker(void* arg) {
-    PriorityQueue* pq = static_cast<PriorityQueue*>(arg);
-
-    while (true) {
-        // 加锁
-        pthread_mutex_lock(&pq->task_mutex);
-        
-        // 如果还没结束且队列中没有任务，就等待（阻塞）
-        while (pq->task_queue.empty() && !pq->all_done) {
-            pthread_cond_wait(&pq->task_cond, &pq->task_mutex);
-        }
-
-        // 如果所有任务都完成了，退出循环
-        if (pq->task_queue.empty() && pq->all_done) {
-            pthread_mutex_unlock(&pq->task_mutex);
-            break;
-        }
-
-        // 取出任务
-        GenerateArg task = pq->task_queue.front();
-        pq->task_queue.pop();
-        // cout << "线程" <<task.thread_id<<"任务开始"<<endl;
-        pthread_mutex_unlock(&pq->task_mutex);
-
-        // 执行任务
-        for (int i = task.start; i < task.end; i++){
-            string temp = task.prefix + task.seg_ptr->ordered_values[i];
-            pq->guesses[task.old_size + i] = temp;
-        }
-        
-        //报告线程完成
-        pthread_mutex_lock(&pq->done_mutex);
-        pq->tasks_remaining--;
-        // cout << "线程" <<task.thread_id<<"任务结束"<<endl;
-        pthread_cond_signal(&pq->done_cond); // 唤醒主线程
-        pthread_mutex_unlock(&pq->done_mutex);   
-    }
-    return NULL;
-}
-
-void PriorityQueue::start_thread_pool() {
-    for (int i = 0; i < NUM_THREADS - 1; i++){
-        pthread_create(&threads[i], NULL, guess_generate_worker, this);
-    }
-    // cout << "开启线程池"<<endl;
-}
-
-void PriorityQueue::stop_thread_pool() {
-    // 通知所有线程退出
-    pthread_mutex_lock(&task_mutex);
-    all_done = true;
-    pthread_mutex_unlock(&task_mutex);
-    pthread_cond_broadcast(&task_cond);
-    
-    // 等待线程结束
-    for (int i = 0; i < NUM_THREADS - 1; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    // cout << "关闭线程池" << endl;
-}
-
 // 这个函数是PCFG并行化算法的主要载体
 // 尽量看懂，然后进行并行实现
 void PriorityQueue::Generate(PT pt)
@@ -270,43 +208,23 @@ void PriorityQueue::Generate(PT pt)
         // 这个过程是可以高度并行化的
 
         int total_items = pt.max_indices[0];
-        int chunk_size = total_items / NUM_THREADS;
+        // int chunk_size = total_items / NUM_THREADS;
         old_size = guesses.size();
         guesses.resize(old_size + total_items);
         // 设定阈值，只有chunk_size>1000时才走多线程，否则走串行逻辑
-        if (chunk_size > 500) {
-            // pthread_count+=1;
-            // 子线程分工（0~NUM_THREADS-1 段）
-            GenerateArg tasks[NUM_THREADS - 1];
-            for (int t = 0; t < NUM_THREADS - 1; t++) {
-                tasks[t].thread_id = t;
-                tasks[t].start = chunk_size * t;
-                tasks[t].end = chunk_size * (t + 1);
-                tasks[t].old_size = old_size;
-                tasks[t].prefix = string();
-                tasks[t].seg_ptr = a;
-            }
-            pthread_mutex_lock(&task_mutex);
-            tasks_remaining = NUM_THREADS - 1;
-            for (int t = 0; t < NUM_THREADS - 1; t++) {
-                task_queue.push(tasks[t]);
-            }
-            pthread_mutex_unlock(&task_mutex);
-            pthread_cond_broadcast(&task_cond); // 唤醒所有线程
-    
-            // 主线程完成最后一段
-            for (int i = chunk_size * (NUM_THREADS - 1); i < total_items; i++) {
-                guesses[old_size + i] = a->ordered_values[i];
-            }
+        if (total_items > 4000) {
+            #pragma omp parallel_generate
+            {
+                int tid = omp_get_thread_num();
+                int nth = omp_get_num_threads();
+                int chunk = total_items / nth;
+                int start = tid * chunk;
+                int end = (tid == nth - 1) ? total_items : (tid + 1) * chunk;
 
-            // 等待子线程
-            pthread_mutex_lock(&done_mutex);
-            while (tasks_remaining > 0) {
-                pthread_cond_wait(&done_cond, &done_mutex); // 等待子线程完成任务
-                // cout << "有一个子线程完成了任务，当前剩余tasks:"<<tasks_remaining<<endl;
+                for (int i = start; i < end; i++) {
+                    guesses[old_size + i] = a->ordered_values[i];
+                }
             }
-            pthread_mutex_unlock(&done_mutex);
-
         } else {
             // serial_count+=1;
             for (int i = 0; i < total_items; i += 1)
@@ -365,41 +283,23 @@ void PriorityQueue::Generate(PT pt)
     
         // 子线程分工（0~NUM_THREADS-1 段）
         int total_items = pt.max_indices[pt.content.size() - 1];
-        int chunk_size = total_items / NUM_THREADS;
+        // int chunk_size = total_items / NUM_THREADS;
         old_size = guesses.size();
         guesses.resize(old_size + total_items);
         // 设定阈值，只有chunk_size > 500 时才走多线程逻辑
-        if (chunk_size > 500) {
-            // pthread_count+=1;
-            GenerateArg tasks[NUM_THREADS - 1];
-            for (int t = 0; t < NUM_THREADS - 1; t++) {
-                tasks[t].thread_id = t;
-                tasks[t].start = chunk_size * t;
-                tasks[t].end = chunk_size * (t + 1);
-                tasks[t].old_size = old_size;
-                tasks[t].prefix = guess;
-                tasks[t].seg_ptr = a;
-            }
-            pthread_mutex_lock(&task_mutex);
-            tasks_remaining = NUM_THREADS - 1;
-            for (int t = 0; t < NUM_THREADS - 1; t++) {
-                task_queue.push(tasks[t]);
-            }
-            pthread_mutex_unlock(&task_mutex);
-            pthread_cond_broadcast(&task_cond); // 唤醒所有线程
-          
-            // 主线程完成最后一段
-            for (int i = chunk_size * (NUM_THREADS - 1); i < total_items; i++) {
-                guesses[old_size + i] = guess + a->ordered_values[i];
-            }
+        if (total_items > 4000) {
+            #pragma omp parallel_generate
+            {
+                int tid = omp_get_thread_num();
+                int nth = omp_get_num_threads();
+                int chunk = total_items / nth;
+                int start = tid * chunk;
+                int end = (tid == nth - 1) ? total_items : (tid + 1) * chunk;
 
-            // 等待子线程
-            pthread_mutex_lock(&done_mutex);
-            while (tasks_remaining > 0) {
-                pthread_cond_wait(&done_cond, &done_mutex); // 等待子线程完成任务
-                // cout << "有一个子线程完成了任务，当前剩余tasks:"<<tasks_remaining<<endl;
+                for (int i = start; i < end; i++) {
+                    guesses[old_size + i] = guess + a->ordered_values[i];
+                }
             }
-            pthread_mutex_unlock(&done_mutex);
         } else {
             // serial_count+=1;
             for (int i = 0; i < total_items; i += 1)

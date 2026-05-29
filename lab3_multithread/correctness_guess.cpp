@@ -12,6 +12,7 @@ using namespace chrono;
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O1
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2
 // g++ correctness_guess.cpp train.cpp guessing.cpp md5.cpp -o test -O2
+// g++ correctness_guess.cpp train.cpp guessing.cpp md5.cpp -o test -O2 -fopenmp
 
 int main()
 {

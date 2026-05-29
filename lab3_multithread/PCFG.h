@@ -143,20 +143,6 @@ public:
 
 };
 
-struct GenerateArg {
-    int thread_id;
-    int start;          // 起始下标（包含）
-    int end;            // 结束下标（不包含）
-    int old_size;
-    string prefix = string(); // 原名guess
-    segment* seg_ptr;        // 输入数组
-    
-};
-
-struct TreadResult {
-    vector<string> local_result;
-};
-
 // 优先队列，用于按照概率降序生成口令猜测
 // 实际上，这个class负责队列维护、口令生成、结果存储的全部过程
 class PriorityQueue
@@ -182,42 +168,4 @@ public:
     int total_guesses = 0;
     int old_size = 0;
     vector<string> guesses;
-
-    pthread_t threads[NUM_THREADS - 1];
-    // 任务队列相关
-    pthread_mutex_t task_mutex;
-    pthread_cond_t task_cond;
-    // 完成计数相关
-    pthread_mutex_t done_mutex;
-    pthread_cond_t done_cond;
-    queue<GenerateArg> task_queue;
-    TreadResult results[NUM_THREADS - 1];
-    bool all_done = false;
-    int tasks_remaining = 0;
-
-    // 启动线程池
-    void start_thread_pool();
-
-    // 停止线程池
-    void stop_thread_pool();
-
-    // 提交一批任务并等待完成
-    void parallel_generate(segment* a,string prefix,int thread_id, int start, int end);
-
-    PriorityQueue() {
-        pthread_mutex_init(&task_mutex, NULL);
-        pthread_cond_init(&task_cond, NULL);
-        pthread_mutex_init(&done_mutex, NULL);
-        pthread_cond_init(&done_cond, NULL);
-    }
-    
-    ~PriorityQueue() {
-        pthread_mutex_destroy(&task_mutex);
-        pthread_cond_destroy(&task_cond);
-        pthread_mutex_destroy(&done_mutex);
-        pthread_cond_destroy(&done_cond);
-    }
-    long long pthread_count = 0,  serial_count = 0;
 };
-
-inline void* guess_generate_worker(void* arg); 
