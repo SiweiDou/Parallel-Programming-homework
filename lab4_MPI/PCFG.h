@@ -144,6 +144,19 @@ public:
 
 };
 
+struct GenerateArg {
+    int thread_id;
+    int start;          // 起始下标（包含）
+    int end;            // 结束下标（不包含）
+    int old_size;
+    string prefix = string(); // 原名guess
+    segment* seg_ptr;        // 输入数组
+    
+};
+
+struct TreadResult {
+    vector<string> local_result;
+};
 
 // 优先队列，用于按照概率降序生成口令猜测
 // 实际上，这个class负责队列维护、口令生成、结果存储的全部过程
@@ -170,5 +183,6 @@ public:
     int total_guesses = 0;
     int old_size = 0;
     vector<string> guesses;
-};
 
+   
+};

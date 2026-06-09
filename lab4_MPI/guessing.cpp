@@ -210,20 +210,43 @@ void PriorityQueue::Generate(PT pt)
             // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
             // 这个过程是可以高度并行化的
 
-            // 此版本MPI的多进程针对的是guess与a->ordered_values[i]的拼接，故在此不进行MPI编程，直接使用串行版本
+            // 此版本MPI的多进程针对的是guess与a->ordered_values[i]的拼接，故在此不进行MPI编程，
+            // 使用多线程方法进行加速
             int total_items = pt.max_indices[0];
             old_size = guesses.size();
             guesses.resize(old_size + total_items);
-            
-            for (int i = 0; i < total_items; i += 1) {
-                guesses[old_size + i] = a->ordered_values[i];
+
+            if (total_items > 4000) {
+                #pragma omp parallel
+                {
+                    int tid = omp_get_thread_num();
+                    int nth = omp_get_num_threads();
+                    int thread_chunk = total_items / nth;
+                    int start = tid * thread_chunk;
+                    int end = (tid == nth - 1) ? total_items : (tid + 1) * thread_chunk;
+                    for (int i = start; i < end; i++) {
+                        guesses[old_size + i] = a->ordered_values[i];
+                    }
+                }
+            } else {
+                for (int i = 0; i < total_items; i += 1) {
+                    guesses[old_size + i] = a->ordered_values[i];
+                }
             }
+            // int total_items = pt.max_indices[0];
+            // old_size = guesses.size();
+            // guesses.resize(old_size + total_items);
+            
+            // for (int i = 0; i < total_items; i += 1) {
+            //     guesses[old_size + i] = a->ordered_values[i];
+            // }
         }
     }
     else
     {
         string guess;
         int total_items = 0;
+        old_size = guesses.size();
         segment *a = nullptr;
 
         // 这个for循环的作用：给当前PT的所有segment赋予实际的值（最后一个segment除外）
@@ -334,13 +357,42 @@ void PriorityQueue::Generate(PT pt)
             // 打包所有局部结果为一条长数据流，只发一次
             if (rank == 0) {
                 // Rank 0 自己先处理分配到的那一份
-                int offset = 0;
-                for (int i = 0; i < strs_per_proc; ++i) {
-                    int len = local_counts[i];
-                    std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
-                    guesses.emplace_back(guess + substr);
-                    offset += len;
+                guesses.resize(old_size + strs_per_proc);
+                if (strs_per_proc > 500) {
+                    // 提前计算好offset
+                    std::vector<int> local_offsets(strs_per_proc, 0);
+                    for (int i = 1; i < strs_per_proc; ++i) {
+                        local_offsets[i] = local_offsets[i - 1] + local_counts[i - 1];
+                    }
+                    #pragma omp parallel
+                    {
+                        int tid = omp_get_thread_num();
+                        int nth = omp_get_num_threads();
+                        int thread_chunk = strs_per_proc / nth;
+                        int start = tid * thread_chunk;
+                        int end = (tid == nth - 1) ? strs_per_proc : start + thread_chunk;
+
+                        for (int i = start; i < end; i++) {
+                            int len = local_counts[i];
+                            std::string substr(recv_buf.begin() + local_offsets[i], recv_buf.begin() + local_offsets[i] + len);
+                            guesses[old_size + i] = guess + substr;
+                        }
+                    }
+                } else {
+                    int offset = 0;
+                    for (int i = 0; i < strs_per_proc; ++i) {
+                        int len = local_counts[i];
+                        std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
+                        guesses[old_size + i] = guess + substr;
+                        offset += len;
+                    }
                 }
+                // for (int i = 0; i < strs_per_proc; ++i) {
+                //     int len = local_counts[i];
+                //     std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
+                //     guesses.emplace_back(guess + substr);
+                //     offset += len;
+                // }
 
                 // 一次性接收其它每个进程的包裹
                 for (int i = 1; i < size; ++i) {
@@ -372,18 +424,78 @@ void PriorityQueue::Generate(PT pt)
             } else {
                 // 非零进程将所有的结果压缩拼接到 flat 字符串流中
                 std::string flat;
-                int offset = 0;
-                for (int i = 0; i < strs_per_proc; ++i) {
-                    int len = local_counts[i];
-                    std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
-                    std::string rs = guess + substr;
-                    int rs_len = rs.size();
-                    
-                    // 将口令的长度(int)和本体(char[])塞入同一块缓冲区
-                    flat.append((char*)&rs_len, sizeof(int));
-                    flat.append(rs);
-                    offset += len;
+                if (strs_per_proc > 500) {
+                    // 获取最大线程数，并为每个线程准备一个专属的字符串桶
+                    int max_threads = omp_get_max_threads();
+                    std::vector<std::string> thread_flats(max_threads);
+
+                    // 解决 offset 的顺序依赖问题（计算前缀和）
+                    // 提前算好每个口令在 recv_buf 中的绝对起始位置
+                    std::vector<int> local_offsets(strs_per_proc, 0);
+                    for (int i = 1; i < strs_per_proc; ++i) {
+                        local_offsets[i] = local_offsets[i - 1] + local_counts[i - 1];
+                    }
+
+                    // 3. 开启并行域
+                    #pragma omp parallel
+                    {
+                        int tid = omp_get_thread_num();
+                        int nth = omp_get_num_threads();
+                        int thread_chunk = strs_per_proc / nth; 
+                        int start = tid * thread_chunk;
+                        int end = (tid == nth - 1) ? strs_per_proc : start + thread_chunk; 
+
+                        std::string thread_flat;
+                        // 预分配内存
+                        thread_flat.reserve((end - start) * guess.size());
+
+                        for (int i = start; i < end; i++) {
+                            int len = local_counts[i]; 
+                            int current_offset = local_offsets[i]; // 获取当前字符串的起始位置
+
+                            std::string substr(recv_buf.begin() + current_offset, recv_buf.begin() + current_offset + len);
+                            std::string rs = guess + substr;
+                            int rs_len = rs.size();
+                            
+                            // 将口令的长度(int)和本体(char[])塞入线程私有的缓冲区
+                            thread_flat.append((char*)&rs_len, sizeof(int));
+                            thread_flat.append(rs);
+                        }
+                        
+                        // 将拼接好的私有字符串用 std::move 高效转移到对应的桶里
+                        thread_flats[tid] = std::move(thread_flat);
+                    } // 隐含的 barrier，等待所有线程完成
+
+                    // 按线程顺序，把桶里的数据拼接到最终的 flat 中
+                    for (int t = 0; t < max_threads; ++t) {
+                        flat += thread_flats[t];
+                    }
+                } 
+                else {
+                    // 数据量小，走串行分支
+                    int offset = 0;
+                    for (int i = 0; i < strs_per_proc; ++i) {
+                        int len = local_counts[i];
+                        std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
+                        std::string rs = guess + substr;
+                        int rs_len = rs.size();
+                        
+                        flat.append((char*)&rs_len, sizeof(int));
+                        flat.append(rs);
+                        offset += len;
+                    }
                 }
+                // for (int i = 0; i < strs_per_proc; ++i) {
+                //     int len = local_counts[i];
+                //     std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
+                //     std::string rs = guess + substr;
+                //     int rs_len = rs.size();
+                    
+                //     // 将口令的长度(int)和本体(char[])塞入同一块缓冲区
+                //     flat.append((char*)&rs_len, sizeof(int));
+                //     flat.append(rs);
+                //     offset += len;
+                // }
                 
                 // 将所有生成好的口令一次性发走，避开缓冲区溢出
                 int total_send_size = flat.size();

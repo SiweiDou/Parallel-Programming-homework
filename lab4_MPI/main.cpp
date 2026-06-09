@@ -15,6 +15,8 @@ using namespace chrono;
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O1
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2
 // g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2 -fopenmp
+// mpic++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2 -fopenmp
+// mpi 提交命令：qsub qsub_mpi.sh
 
 int main(int argc, char* argv[])
 { 
