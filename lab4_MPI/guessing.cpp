@@ -176,290 +176,126 @@ vector<PT> PT::NewPTs()
     return res;
 }
 
-inline void* guess_generate_worker(void* arg) {
-    PriorityQueue* pq = static_cast<PriorityQueue*>(arg);
-
-    while (true) {
-        // 加锁
-        pthread_mutex_lock(&pq->task_mutex);
-        
-        // 如果还没结束且队列中没有任务，就等待（阻塞）
-        while (pq->task_queue.empty() && !pq->all_done) {
-            pthread_cond_wait(&pq->task_cond, &pq->task_mutex);
-        }
-
-        // 如果所有任务都完成了，退出循环
-        if (pq->task_queue.empty() && pq->all_done) {
-            pthread_mutex_unlock(&pq->task_mutex);
-            break;
-        }
-
-        // 取出任务
-        GenerateArg task = pq->task_queue.front();
-        pq->task_queue.pop();
-        // cout << "线程" <<task.thread_id<<"任务开始"<<endl;
-        pthread_mutex_unlock(&pq->task_mutex);
-
-        // 执行任务
-        for (int i = task.start; i < task.end; i++){
-            string temp = task.prefix + task.seg_ptr->ordered_values[i];
-            // 在MPI编程中需要修改，现在是对进程分配得到的数据进行修改。如何传入local_guesses?
-            pq->guesses[task.old_size + i] = temp;
-        }
-        
-        //报告线程完成
-        pthread_mutex_lock(&pq->done_mutex);
-        pq->tasks_remaining--;
-        // cout << "线程" <<task.thread_id<<"任务结束"<<endl;
-        pthread_cond_signal(&pq->done_cond); // 唤醒主线程
-        pthread_mutex_unlock(&pq->done_mutex);   
-    }
-    
-    return NULL;
-}
-
-void PriorityQueue::start_thread_pool() {
-    for (int i = 0; i < NUM_THREADS - 1; i++){
-        pthread_create(&threads[i], NULL, guess_generate_worker, this);
-    }
-    // cout << "开启线程池"<<endl;
-}
-
-void PriorityQueue::stop_thread_pool() {
-    // 通知所有线程退出
-    pthread_mutex_lock(&task_mutex);
-    all_done = true;
-    pthread_mutex_unlock(&task_mutex);
-    pthread_cond_broadcast(&task_cond);
-    
-    // 等待线程结束
-    for (int i = 0; i < NUM_THREADS - 1; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    // cout << "关闭线程池" << endl;
-}
-
 // 这个函数是PCFG并行化算法的主要载体
 // 尽量看懂，然后进行并行实现
 void PriorityQueue::Generate(PT pt)
 {
-    // 计算PT的概率，这里主要是给PT的概率进行初始化
-    CalProb(pt);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // 对于只有一个segment的PT，直接遍历生成其中的所有value即可
-    if (pt.content.size() == 1)
+    int pt_size = 0;
+    if (rank == 0) {
+        CalProb(pt); // 仅 rank 0 需要计算概率
+        pt_size = pt.content.size();
+    }
+    
+    // 强制所有进程同步 PT 的长度
+    // 因为 rank 1~N 传入的 pt 可能是空的，如果不统一口径，会导致部分进程进 if，部分进 else 从而卡死
+    MPI_Bcast(&pt_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (pt_size == 1)
     {
-        // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        segment *a;
-        // 在模型中定位到这个segment
-        if (pt.content[0].type == 1)
+        if (rank == 0) 
         {
-            a = &m.letters[m.FindLetter(pt.content[0])];
-        }
-        if (pt.content[0].type == 2)
-        {
-            a = &m.digits[m.FindDigit(pt.content[0])];
-        }
-        if (pt.content[0].type == 3)
-        {
-            a = &m.symbols[m.FindSymbol(pt.content[0])];
-        }
-        
-        // Multi-thread TODO：
-        // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
-        // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
-        // 这个过程是可以高度并行化的
+            // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
+            segment *a = nullptr;
+            // 在模型中定位到这个segment
+            if (pt.content[0].type == 1) a = &m.letters[m.FindLetter(pt.content[0])];
+            if (pt.content[0].type == 2) a = &m.digits[m.FindDigit(pt.content[0])];
+            if (pt.content[0].type == 3) a = &m.symbols[m.FindSymbol(pt.content[0])];
 
-        int total_items = pt.max_indices[0];
-        int chunk_size = total_items / NUM_THREADS;
-        old_size = guesses.size();
-        guesses.resize(old_size + total_items);
-        // 设定阈值，只有chunk_size>1000时才走多线程，否则走串行逻辑
-        // 暂时关闭多线程逻辑，测试串行基准时间
-        // if (total_items > 500)
-        if (false)
-        {
-            // 子线程分工（0~NUM_THREADS-1 段）
-            GenerateArg tasks[NUM_THREADS - 1];
-            for (int t = 0; t < NUM_THREADS - 1; t++) {
-                tasks[t].thread_id = t;
-                tasks[t].start = chunk_size * t;
-                tasks[t].end = chunk_size * (t + 1);
-                tasks[t].old_size = old_size;
-                tasks[t].prefix = string();
-                tasks[t].seg_ptr = a;
-            }
-            pthread_mutex_lock(&task_mutex);
-            tasks_remaining = NUM_THREADS - 1;
-            for (int t = 0; t < NUM_THREADS - 1; t++) {
-                task_queue.push(tasks[t]);
-            }
-            pthread_mutex_unlock(&task_mutex);
-            pthread_cond_broadcast(&task_cond); // 唤醒所有线程
-        
-            for (int i = chunk_size * (NUM_THREADS - 1); i < total_items; i++) {
+            // Multi-thread TODO：
+            // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
+            // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
+            // 这个过程是可以高度并行化的
+
+            // 此版本MPI的多进程针对的是guess与a->ordered_values[i]的拼接，故在此不进行MPI编程，直接使用串行版本
+            int total_items = pt.max_indices[0];
+            old_size = guesses.size();
+            guesses.resize(old_size + total_items);
+            
+            for (int i = 0; i < total_items; i += 1) {
                 guesses[old_size + i] = a->ordered_values[i];
             }
-
-            // 等待子线程
-            pthread_mutex_lock(&done_mutex);
-            while (tasks_remaining > 0) {
-                pthread_cond_wait(&done_cond, &done_mutex); // 等待子线程完成任务
-                // cout << "有一个子线程完成了任务，当前剩余tasks:"<<tasks_remaining<<endl;
-            }
-            pthread_mutex_unlock(&done_mutex);        
-        } else {
-            // serial_count+=1;
-            int rank = MPI::COMM_WORLD.Get_rank();
-            if (rank == 0){
-                for (int i = 0; i < total_items; i += 1)
-                {
-                    guesses[old_size + i] = a->ordered_values[i];
-                }
-            }        
-        }   
+        }
     }
     else
     {
         string guess;
-        int seg_idx = 0;
+        int total_items = 0;
+        segment *a = nullptr;
+
         // 这个for循环的作用：给当前PT的所有segment赋予实际的值（最后一个segment除外）
         // segment值根据curr_indices中对应的值加以确定
         // 这个for循环你看不懂也没太大问题，并行算法不涉及这里的加速
-        for (int idx : pt.curr_indices)
-        {
-            if (pt.content[seg_idx].type == 1)
+        if (rank == 0) {
+            int seg_idx = 0;
+            for (int idx : pt.curr_indices)
             {
-                guess += m.letters[m.FindLetter(pt.content[seg_idx])].ordered_values[idx];
+                if (pt.content[seg_idx].type == 1) guess += m.letters[m.FindLetter(pt.content[seg_idx])].ordered_values[idx];
+                if (pt.content[seg_idx].type == 2) guess += m.digits[m.FindDigit(pt.content[seg_idx])].ordered_values[idx];
+                if (pt.content[seg_idx].type == 3) guess += m.symbols[m.FindSymbol(pt.content[seg_idx])].ordered_values[idx];
+                seg_idx += 1;
+                if (seg_idx == pt.content.size() - 1) break; // 留出最后一个段用于遍历展开
             }
-            if (pt.content[seg_idx].type == 2)
-            {
-                guess += m.digits[m.FindDigit(pt.content[seg_idx])].ordered_values[idx];
-            }
-            if (pt.content[seg_idx].type == 3)
-            {
-                guess += m.symbols[m.FindSymbol(pt.content[seg_idx])].ordered_values[idx];
-            }
-            seg_idx += 1;
-            if (seg_idx == pt.content.size() - 1)
-            {
-                break;
-            }
+            
+            if (pt.content[pt.content.size() - 1].type == 1) a = &m.letters[m.FindLetter(pt.content[pt.content.size() - 1])];
+            if (pt.content[pt.content.size() - 1].type == 2) a = &m.digits[m.FindDigit(pt.content[pt.content.size() - 1])];
+            if (pt.content[pt.content.size() - 1].type == 3) a = &m.symbols[m.FindSymbol(pt.content[pt.content.size() - 1])];
+            total_items = pt.max_indices[pt.content.size() - 1];// 后缀的总数
         }
-        // 指向最后一个segment的指针，这个指针实际指向模型中的统计数据
-        segment *a;
-        if (pt.content[pt.content.size() - 1].type == 1)
-        {
-            a = &m.letters[m.FindLetter(pt.content[pt.content.size() - 1])];
-        }
-        if (pt.content[pt.content.size() - 1].type == 2)
-        {
-            a = &m.digits[m.FindDigit(pt.content[pt.content.size() - 1])];
-        }
-        if (pt.content[pt.content.size() - 1].type == 3)
-        {
-            a = &m.symbols[m.FindSymbol(pt.content[pt.content.size() - 1])];
+
+        // 向所有进程广播拼接好的固定前缀guess
+        int guess_len = 0;
+        if (rank == 0) guess_len = guess.size();
+        MPI_Bcast(&guess_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        
+        if (guess_len > 0) {
+            // 不使用string的指针操作，用vector<char>进行中转避免C++ 中短字符串优化(SSO)机制可能引发的内存段错误
+            std::vector<char> safe_buf(guess_len);
+            if (rank == 0) {
+                std::copy(guess.begin(), guess.end(), safe_buf.begin());
+            }
+            MPI_Bcast(safe_buf.data(), guess_len, MPI_CHAR, 0, MPI_COMM_WORLD);
+            if (rank != 0) {
+                guess = std::string(safe_buf.begin(), safe_buf.end());// 接收后重建为 string
+            }
         }
         
-        // Multi-thread TODO：
-        // 这个for循环就是你需要进行并行化的主要部分了，特别是在多线程&GPU编程任务中
-        // 可以看到，这个循环本质上就是把模型中一个segment的所有value，赋值到PT中，形成一系列新的猜测
-        // 这个过程是可以高度并行化的
-    
-        // 子线程分工（0~NUM_THREADS-1 段）
-        int total_items = pt.max_indices[pt.content.size() - 1];
-        int chunk_size = total_items / NUM_THREADS;
-        // old_size = guesses.size();
-        // guesses.resize(old_size + total_items);
-        // 设定阈值，只有chunk_size > 500 时才走多线程逻辑
+        // 广播 total_items
+        MPI_Bcast(&total_items, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
         if (total_items > 500) 
-        // 暂时回退到串行版本进行实验
-        // if (false)
-        {   
-            int rank, size;
-            rank = MPI::COMM_WORLD.Get_rank();
-            size = MPI::COMM_WORLD.Get_size();
+        {
+            // 计算每个进程分摊的后缀数量（向下取整）
+            int strs_per_proc = total_items / size; 
+            std::vector<int> local_counts(strs_per_proc);
+            std::vector<char> recv_buf;
 
-            int guess_len;
+            // 主进程将后缀字符数组切割并分发
             if (rank == 0) {
-                guess_len = guess.size();
-            }
-            MPI_Bcast(&guess_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
-            if (rank != 0) {
-                guess.resize(guess_len);
-            }
-            MPI_Bcast(&guess[0], guess_len, MPI_CHAR, 0, MPI_COMM_WORLD);
-            MPI_Bcast(&total_items, 1, MPI_INT, 0, MPI_COMM_WORLD);
-            // 主线程将a->ordered_values分发给子线程，
-            // 子线程完成guess + a->ordered_values拼接后将结果返回，
-            // 最后将这些结果都接到guesses后面
-
-            // 获取每个进程分配的字符串数
-            int num_strs_per_proc = total_items / size;
-            // int my_start, my_end;
-            // // 计算自己的区间（主进程处理尾部）
-            // if (rank == 0) {
-            //     my_start = num_strs_per_proc * (size - 1);
-            //     my_end = total_items;
-            // } else {
-            //     my_start = num_strs_per_proc * (rank - 1);
-            //     my_end = my_start + num_strs_per_proc;
-            // }
-
-            // // 本地生成
-            // vector<string> local;
-            // for (int i = my_start; i < my_end; i++) {
-            //     local.push_back(guess + a->ordered_values[i]);
-            // }
-
-
-            // // 汇总到 rank 0
-            // if (rank == 0) {
-            //     guesses.insert(guesses.end(), local.begin(), local.end());
-            //     for (int r = 1; r < size; r++) {
-            //         int count;
-            //         MPI_Recv(&count, 1, MPI_INT, r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            //         for (int j = 0; j < count; j++) {
-            //             int len;
-            //             MPI_Recv(&len, 1, MPI_INT, r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            //             string s(len, '\0');
-            //             MPI_Recv(&s[0], len, MPI_CHAR, r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            //             guesses.push_back(s);
-            //         }
-            //     }
-            // } else {
-            //     int count = local.size();
-            //     MPI_Send(&count, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
-            //     for (const string& s : local) {
-            //         int len = s.size();
-            //         MPI_Send(&len, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
-            //         MPI_Send(s.c_str(), len, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
-            //     }
-            // }
-            if (rank == 0) {
-                // 构建 counts 和 displs 数组（长度和偏移量）
-                std::vector<int> counts(size * num_strs_per_proc);
-                std::vector<int> displs(size * num_strs_per_proc);
+                int chunk = size * strs_per_proc;
+                std::vector<int> counts(chunk); // 记录每个后缀的长度
+                std::vector<int> displs(chunk); // 记录每个后缀在连续内存块中的偏移量
                 int total_char_len = 0;
-                for (int i = 0; i < size * num_strs_per_proc; ++i) {
+                // 预计算偏移量并分配总内存
+                for (int i = 0; i < chunk; ++i) {
                     counts[i] = a->ordered_values[i].size();
                     displs[i] = total_char_len;
                     total_char_len += counts[i];
                 }
 
-                // 构建扁平化字符缓冲区
+                // 将所有后缀字符串存入一维字符数组 send_buf
                 std::vector<char> send_buf(total_char_len);
                 int offset = 0;
-                for (const auto& s : a->ordered_values) {
+                for (int i = 0; i < chunk; ++i) { 
+                    const auto& s = a->ordered_values[i];
                     std::copy(s.begin(), s.end(), send_buf.begin() + offset);
                     offset += s.size();
                 }
 
-                // 分发长度数组
-                int strs_per_proc = num_strs_per_proc;
-                MPI_Bcast(&strs_per_proc, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-                // 分发字符数组
+                // 统计每个进程应该接收的总字符数 (recv_counts) 及其偏移量 (recv_displs)
                 std::vector<int> recv_counts(size);
                 std::vector<int> recv_displs(size);
                 for (int i = 0; i < size; ++i) {
@@ -471,139 +307,96 @@ void PriorityQueue::Generate(PT pt)
                     recv_displs[i] = displs[i * strs_per_proc];
                 }
 
-                // 发送每个进程的字符串长度
-                std::vector<int> local_counts(strs_per_proc);
+                // 告诉每个进程它将收到的每个字符串的长度
                 MPI_Scatter(counts.data(), strs_per_proc, MPI_INT,
                             local_counts.data(), strs_per_proc, MPI_INT,
                             0, MPI_COMM_WORLD);
-  
-                // 发送字符数据
-                std::vector<char> recv_buf(recv_counts[rank]);
+
+                // 将一维字符数组切割并发送给对应进程
+                recv_buf.resize(recv_counts[rank]);
                 MPI_Scatterv(send_buf.data(), recv_counts.data(), recv_displs.data(), MPI_CHAR,
-                            recv_buf.data(), recv_counts[rank], MPI_CHAR,
-                            0, MPI_COMM_WORLD);
-
-                // 每个进程现在可以重建自己的 vector<string>
+                             recv_buf.data(), recv_counts[rank], MPI_CHAR,
+                             0, MPI_COMM_WORLD);
             } else {
-                // 非主进程：先接收字符串数量
-                int strs_per_proc = 0;
-                MPI_Bcast(&strs_per_proc, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-                std::vector<int> local_counts(strs_per_proc);
-                MPI_Scatter(nullptr, 0, MPI_INT,   // 发送缓冲区仅 rank0 使用
+                // 子进程接收长度数组与字符数据
+                MPI_Scatter(nullptr, strs_per_proc, MPI_INT,
                             local_counts.data(), strs_per_proc, MPI_INT,
                             0, MPI_COMM_WORLD);
 
-                // 计算本地接收总字符数
                 int total_len = 0;
                 for (int len : local_counts) total_len += len;
-                std::vector<char> recv_buf(total_len);
-
-                // 计算接收偏移量（每个进程知道自己需要接收的数据量，但不需要知道全局 displs）
-                // 使用 MPI_Scatterv 时，接收端只需要提供接收缓冲区的起始地址和接收长度即可
-                MPI_Scatterv(nullptr, nullptr, nullptr, MPI_CHAR,  // 发送端参数仅 rank0 有效
-                            recv_buf.data(), total_len, MPI_CHAR,
-                            0, MPI_COMM_WORLD);
-            }
-            // // 重新获取每个进程的字符串个数（之前已广播）
-            // int strs_per_proc = num_strs_per_proc;
-            // MPI_Bcast(&strs_per_proc, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-            // // 接收每个字符串的长度
-            // std::vector<int> local_counts(strs_per_proc);
-            // MPI_Scatter(nullptr, 0, MPI_INT, 
-            //             local_counts.data(), strs_per_proc, MPI_INT,
-            //             0, MPI_COMM_WORLD);
-
-            // // 接收字符数据
-            // int total_len = 0;
-            // for (int len : local_counts) total_len += len;
-            // std::vector<char> recv_buf(total_len);
-            // MPI_Scatterv(nullptr, nullptr, nullptr, MPI_CHAR,
-            //             recv_buf.data(), total_len, MPI_CHAR,
-            //             0, MPI_COMM_WORLD);
-
-            // 重建 vector<string>并与guess进行拼接
-            std::vector<std::string> local_strings;
-            int offset = 0;
-            for (int i = 0; i < strs_per_proc; ++i) {
-                int len = local_counts[i];
-                std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
-                local_strings.emplace_back(guess + substr);
-                offset += len;
+                recv_buf.resize(total_len);
+                MPI_Scatterv(nullptr, nullptr, nullptr, MPI_CHAR,
+                             recv_buf.data(), total_len, MPI_CHAR,
+                             0, MPI_COMM_WORLD);
             }
 
-            // 回收字符串，拼接到guesses上
+            // 打包所有局部结果为一条长数据流，只发一次
             if (rank == 0) {
-                // 主进程先处理自己的结果
-                for (const auto& rs : local_strings) {
-                    guesses.emplace_back(rs);
+                // Rank 0 自己先处理分配到的那一份
+                int offset = 0;
+                for (int i = 0; i < strs_per_proc; ++i) {
+                    int len = local_counts[i];
+                    std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
+                    guesses.emplace_back(guess + substr);
+                    offset += len;
                 }
 
-                // 依次接收其他进程的结果
+                // 一次性接收其它每个进程的包裹
                 for (int i = 1; i < size; ++i) {
-                    // 先接收该进程有多少个结果字符串
-                    int num_results = 0;
-                    MPI_Recv(&num_results, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-                    // 接收每个结果字符串的长度和内容
-                    for (int j = 0; j < num_results; ++j) {
-                        int len = 0;
-                        MPI_Recv(&len, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-                        std::string tmp(len, '\0');
-                        MPI_Recv(&tmp[0], len, MPI_CHAR, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-                        guesses.emplace_back(tmp);  // 用 emplace_back 添加到尾部
+                    int total_recv_size = 0;
+                    // 接收包裹的总字节数
+                    MPI_Recv(&total_recv_size, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    
+                    if (total_recv_size > 0) {
+                        std::vector<char> flat_buf(total_recv_size);
+                        MPI_Recv(flat_buf.data(), total_recv_size, MPI_CHAR, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                        
+                        // 按 [长度(int)] + [字符本体(char[])] 的规则还原
+                        // 解包数据流恢复成口令字符串
+                        int ptr = 0;
+                        while (ptr < total_recv_size) {
+                            int rs_len = *(int*)(flat_buf.data() + ptr); // 提取口令长度
+                            ptr += sizeof(int);
+                            guesses.emplace_back(std::string(flat_buf.data() + ptr, rs_len)); // 提取口令本体
+                            ptr += rs_len;
+                        }
                     }
                 }
-            } else {
-                // 非主进程：发送自己的结果给主进程
-                int num_results = local_strings.size();
-                MPI_Send(&num_results, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
 
-                for (const auto& rs : local_strings) {
-                    int len = rs.size();
-                    MPI_Send(&len, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
-                    MPI_Send(rs.c_str(), len, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+                // 处理无法整除的残余口令
+                int chunk = size * strs_per_proc;
+                for (int i = chunk; i < total_items; ++i) {
+                    guesses.push_back(guess + a->ordered_values[i]);
+                }
+            } else {
+                // 非零进程将所有的结果压缩拼接到 flat 字符串流中
+                std::string flat;
+                int offset = 0;
+                for (int i = 0; i < strs_per_proc; ++i) {
+                    int len = local_counts[i];
+                    std::string substr(recv_buf.begin() + offset, recv_buf.begin() + offset + len);
+                    std::string rs = guess + substr;
+                    int rs_len = rs.size();
+                    
+                    // 将口令的长度(int)和本体(char[])塞入同一块缓冲区
+                    flat.append((char*)&rs_len, sizeof(int));
+                    flat.append(rs);
+                    offset += len;
+                }
+                
+                // 将所有生成好的口令一次性发走，避开缓冲区溢出
+                int total_send_size = flat.size();
+                MPI_Send(&total_send_size, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+                if (total_send_size > 0) {
+                    MPI_Send(flat.data(), total_send_size, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
                 }
             }
-
-
-            // GenerateArg tasks[NUM_THREADS - 1];
-            // for (int t = 0; t < NUM_THREADS - 1; t++) {
-            //     tasks[t].thread_id = t;
-            //     tasks[t].start = chunk_size * t;
-            //     tasks[t].end = chunk_size * (t + 1);
-            //     tasks[t].old_size = old_size;
-            //     tasks[t].prefix = guess;
-            //     tasks[t].seg_ptr = a;
-            // }
-            // pthread_mutex_lock(&task_mutex);
-            // tasks_remaining = NUM_THREADS - 1;
-            // for (int t = 0; t < NUM_THREADS - 1; t++) {
-            //     task_queue.push(tasks[t]);
-            // }
-            // pthread_mutex_unlock(&task_mutex);
-            // pthread_cond_broadcast(&task_cond); // 唤醒所有线程
-           
-            // // 主线程完成最后一段
-            // for (int i = chunk_size * (NUM_THREADS - 1); i < total_items; i++) {
-            //     guesses[old_size + i] = guess + a->ordered_values[i];
-            // }
-
-            // // 等待子线程
-            // pthread_mutex_lock(&done_mutex);
-            // while (tasks_remaining > 0) {
-            //     pthread_cond_wait(&done_cond, &done_mutex); // 等待子线程完成任务
-            //     // cout << "有一个子线程完成了任务，当前剩余tasks:"<<tasks_remaining<<endl;
-            // }
-            // pthread_mutex_unlock(&done_mutex);
         } else {
-            // serial_count+=1;
-            for (int i = 0; i < total_items; i += 1)
-            {
-                guesses[old_size + i] = guess + a->ordered_values[i];
+            if (rank == 0) {
+                for (int i = 0; i < total_items; i += 1) {
+                    guesses.push_back(guess + a->ordered_values[i]);
+                }
             }
         }
     }

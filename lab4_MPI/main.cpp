@@ -20,11 +20,18 @@ int main(int argc, char* argv[])
 { 
     MPI_Init(&argc, &argv);
     int size, rank;
-    size = MPI::COMM_WORLD.Get_size();
-    rank = MPI::COMM_WORLD.Get_rank();
-
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank == 0) {
+        auto now = system_clock::now();
+        // 转换为 time_t 以便格式化输出
+        std::time_t now_time = system_clock::to_time_t(now);
+        cout << "Test started at: " << std::put_time(std::localtime(&now_time), "%Y-%m-%d %H:%M:%S") << endl;
+        
+    }
     //打印运行时间戳
     if (rank == 0) {
+       
         cout << "Testing MD5Hash correctness..." << endl;
         string test_pws[8] = {"123456", "password", "12345678", "qwerty", "123456789", "12345", "1234", "111111"};
         string test_hashes[8] = {
@@ -198,71 +205,101 @@ int main(int argc, char* argv[])
     //     }
     // }
 
-    while (!q.priority.empty())
+    while (true)
     {
-        q.PopNext();
-        q.total_guesses = q.guesses.size();
-        if (q.total_guesses - curr_num >= 100000)
-        {
-            // cout << "Guesses generated: " <<history + q.total_guesses << endl;
-            curr_num = q.total_guesses;
+        // ===== Step 1: 检查队列是否空 =====
+        int empty;
+        if (rank == 0) {
+            empty = q.priority.empty() ? 1 : 0;
+        }
+        MPI_Bcast(&empty, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (empty) break;
 
-            // 在此处更改实验生成的猜测上限
-            int generate_n=10000000;
-            if (history + q.total_guesses > 10000000)
-            {
-                auto end = system_clock::now();
-                auto duration = duration_cast<microseconds>(end - start);
-                time_guess = double(duration.count()) * microseconds::period::num / microseconds::period::den;
-                cout << "Guess time:" << time_guess - time_hash << "seconds"<< endl;//请不要修改这一行
-                cout << "Hash time:" << time_hash << "seconds"<<endl;//请不要修改这一行
-                cout << "Train time:" << time_train <<"seconds"<<endl;//请不要修改这一行
+        // ===== Step 2: 全员 Generate（内部按 rank 分工 + MPI 汇总）=====
+        PT pt_front;  // rank 1~7 用空的 PT 也无妨，Generate 内部会收广播
+        if (rank == 0) {
+            pt_front = q.priority.front();
+        }
+        q.Generate(pt_front);
 
-                q.stop_thread_pool();
+        int should_stop = 0;
+        // ===== Step 3: 队列操作（仅 rank 0）=====
+        if (rank == 0) {
+            q.total_guesses = q.guesses.size();
 
-                // cout << "PriorityQueue::Generate中，进入多线程分支 " << q.pthread_count << "次"<<endl;
-                // cout << "进入单线程分支" << q.serial_count << "次"<<endl;
-                break;
+            // NewPTs + 插入
+            vector<PT> new_pts = pt_front.NewPTs();
+            for (PT& new_pt : new_pts) {
+                q.CalProb(new_pt);
+                // 按概率插入 priority
+                for (auto iter = q.priority.begin(); iter != q.priority.end(); iter++) {
+                    if (iter != q.priority.end() - 1 && iter != q.priority.begin()) {
+                        if (new_pt.prob <= iter->prob && new_pt.prob > (iter + 1)->prob) {
+                            q.priority.emplace(iter + 1, new_pt);
+                            break;
+                        }
+                    }
+                    if (iter == q.priority.end() - 1) {
+                        q.priority.emplace_back(new_pt);
+                        break;
+                    }
+                    if (iter == q.priority.begin() && iter->prob < new_pt.prob) {
+                        q.priority.emplace(iter, new_pt);
+                        break;
+                    }
+                }
+            }
+            q.priority.erase(q.priority.begin());
+
+            // 进度判断和停止条件
+            if (q.total_guesses - curr_num >= 100000) {
+                curr_num = q.total_guesses;
+                int generate_n = 10000000;
+                if (history + q.total_guesses > 10000000) {
+                    auto end = system_clock::now();
+                    auto duration = duration_cast<microseconds>(end - start);
+                    time_guess = double(duration.count()) * microseconds::period::num / microseconds::period::den;
+                    cout << "Guess time:" << time_guess - time_hash << "seconds" << endl;
+                    cout << "Hash time:" << time_hash << "seconds" << endl;
+                    cout << "Train time:" << time_train << "seconds" << endl;
+                    should_stop = 1;
+                }
+            }
+
+            // 哈希
+            if (curr_num > 500000) {
+                auto start_hash = system_clock::now();
+                bit32 state_batch[4][4];
+                int count = 0;
+                string input_arry[4];
+                for (string pw : q.guesses) {
+                    input_arry[count++] = pw;
+                    if (count == 4) {
+                        MD5HashBatch(input_arry, state_batch);
+                        count = 0;
+                    }
+                }
+                if (count > 0) {
+                    for (int i = 0; i < count; ++i) {
+                        bit32 state[4];
+                        MD5Hash(input_arry[i], state);
+                    }
+                }
+                auto end_hash = system_clock::now();
+                auto duration = duration_cast<microseconds>(end_hash - start_hash);
+                time_hash += double(duration.count()) * microseconds::period::num / microseconds::period::den;
+                history += curr_num;
+                curr_num = 0;
+                q.guesses.clear();
             }
         }
-        // 为了避免内存超限，我们在q.guesses中口令达到一定数目时，将其中的所有口令取出并且进行哈希
-        // 然后，q.guesses将会被清空。为了有效记录已经生成的口令总数，维护一个history变量来进行记录
-        // if (q.guesses.size() >= 8) 发现性能没有提升，可能是条件过于苛刻，导致没有进入分支，我们修改进入分支的条件，只要基类够8个就执行
-        if (curr_num > 500000) 
-        {
-            auto start_hash = system_clock::now();
-            bit32 state_batch[4][4];
-            int count = 0;
-            string input_arry[4];
-            for(string pw : q.guesses)
-            {
-                input_arry[count++] = pw;
-                if (count == 4){
-                    MD5HashBatch(input_arry, state_batch);
-                    count = 0;
-                }
-            }
-            // 处理剩余不足4个的口令（用标量版本完成）
-            if (count > 0)
-            {
-                for (int i = 0; i < count; ++i)
-                {
-                    bit32 state[4];
-                    MD5Hash(input_arry[i], state); // 调用原始的标量 MD5Hash
-                }
-            }
 
-            // 在这里对哈希所需的总时长进行计算
-            auto end_hash = system_clock::now();
-            auto duration = duration_cast<microseconds>(end_hash - start_hash);
-            time_hash += double(duration.count()) * microseconds::period::num / microseconds::period::den;
-
-            // 记录已经生成的口令总数
-            history += curr_num;
-            curr_num = 0;
-            q.guesses.clear();
+        // ===== Step 3.5: 广播停止信号（所有进程参与）=====
+        MPI_Bcast(&should_stop, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (should_stop) {
+            break; 
         }
     }
-    
+
     MPI_Finalize();
 }
