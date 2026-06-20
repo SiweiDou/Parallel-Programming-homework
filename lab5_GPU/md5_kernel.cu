@@ -155,14 +155,21 @@ static bool PadPassword(const string& input, unsigned char padded[64])
     return true;
 }
 
-int MD5HashBatch_GPU(const string* inputs, int n, bit32* results)
+// GPU v2: use cudaHostAlloc pinned memory for faster PCIe transfers
+// Returns number of passwords hashed on GPU. kernel_ms is set to kernel execution time.
+int MD5HashBatch_GPU(const string* inputs, int n, bit32* results, float* kernel_ms = nullptr)
 {
     if (n == 0) return 0;
+    if (kernel_ms) *kernel_ms = 0.0f;
 
-    unsigned char* h_padded = new unsigned char[n * 64];
-    bool* valid = new bool[n];
+    // Stage 1: Pad all passwords on CPU (into pinned memory)
+    unsigned char *h_padded, *h_compact;
+    bit32 *h_results_gpu;
+    bool* valid = (bool*)malloc(n * sizeof(bool));
+    int* gpu_to_cpu_map = (int*)malloc(n * sizeof(int));
     int valid_count = 0;
-    int* gpu_to_cpu_map = new int[n];
+
+    cudaHostAlloc(&h_padded, n * 64, cudaHostAllocDefault);
 
     for (int i = 0; i < n; ++i) {
         valid[i] = PadPassword(inputs[i], h_padded + i * 64);
@@ -172,27 +179,47 @@ int MD5HashBatch_GPU(const string* inputs, int n, bit32* results)
         }
     }
 
-    if (valid_count == 0) { delete[] h_padded; delete[] valid; delete[] gpu_to_cpu_map; return 0; }
+    if (valid_count == 0) {
+        cudaFreeHost(h_padded); free(valid); free(gpu_to_cpu_map);
+        return 0;
+    }
 
-    unsigned char* h_compact = new unsigned char[valid_count * 64];
+    // Stage 2: Compact and copy to GPU
+    cudaHostAlloc(&h_compact, valid_count * 64, cudaHostAllocDefault);
     for (int i = 0; i < valid_count; ++i)
         memcpy(h_compact + i * 64, h_padded + gpu_to_cpu_map[i] * 64, 64);
-    delete[] h_padded;
+    cudaFreeHost(h_padded);
 
     unsigned char* d_padded;  bit32* d_results;
     cudaMalloc(&d_padded, valid_count * 64);
     cudaMalloc(&d_results, valid_count * 4 * sizeof(bit32));
     cudaMemcpy(d_padded, h_compact, valid_count * 64, cudaMemcpyHostToDevice);
-    delete[] h_compact;
+    cudaFreeHost(h_compact);
+
+    // Stage 3: Launch kernel with timing
+    cudaEvent_t start_ev, stop_ev;
+    cudaEventCreate(&start_ev);
+    cudaEventCreate(&stop_ev);
 
     int block_size = 256;
     int grid_size = (valid_count + block_size - 1) / block_size;
+
+    cudaEventRecord(start_ev, 0);
     MD5Kernel<<<grid_size, block_size>>>(d_padded, d_results, valid_count);
+    cudaEventRecord(stop_ev, 0);
     cudaDeviceSynchronize();
 
-    bit32* h_results_gpu = new bit32[valid_count * 4];
+    if (kernel_ms) {
+        cudaEventElapsedTime(kernel_ms, start_ev, stop_ev);
+    }
+    cudaEventDestroy(start_ev);
+    cudaEventDestroy(stop_ev);
+
+    // Stage 4: Copy results back
+    cudaHostAlloc(&h_results_gpu, valid_count * 4 * sizeof(bit32), cudaHostAllocDefault);
     cudaMemcpy(h_results_gpu, d_results, valid_count * 4 * sizeof(bit32), cudaMemcpyDeviceToHost);
 
+    // Stage 5: Scatter results
     for (int i = 0; i < valid_count; ++i) {
         int orig_idx = gpu_to_cpu_map[i];
         results[orig_idx * 4 + 0] = h_results_gpu[i * 4 + 0];
@@ -202,6 +229,7 @@ int MD5HashBatch_GPU(const string* inputs, int n, bit32* results)
     }
 
     cudaFree(d_padded);  cudaFree(d_results);
-    delete[] h_results_gpu;  delete[] valid;  delete[] gpu_to_cpu_map;
+    cudaFreeHost(h_results_gpu);
+    free(valid);  free(gpu_to_cpu_map);
     return valid_count;
 }
