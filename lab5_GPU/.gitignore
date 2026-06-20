@@ -1,0 +1,14 @@
+# 实验数据与报告（仅保留本地）
+GPU实验数据.txt
+报告草稿.txt
+
+# 大型数据集
+guessdata/
+
+# PDF 和文档
+*.pdf
+*.docx
+
+# 编译产物
+main
+*.o
