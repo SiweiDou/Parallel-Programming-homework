@@ -49,4 +49,9 @@ inline void II(bit32 &a, bit32 b, bit32 c, bit32 d, bit32 x, int s, bit32 ac) {
 void MD5Hash(string input, bit32 *state);
 void MD5HashBatch(const string input_arry[4], bit32 state_batch[4][4]);
 
+// GPU-accelerated batch MD5 hash
+// Returns number of passwords successfully hashed on GPU (<=55 chars each)
+// Passwords >55 chars must be handled by caller separately with CPU fallback
+int MD5HashBatch_GPU(const string* inputs, int n, bit32* results);
+
 #endif

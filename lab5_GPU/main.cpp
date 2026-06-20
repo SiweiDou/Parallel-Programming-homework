@@ -6,15 +6,8 @@
 #include <iomanip>
 #include <ctime>
 #include <cstdlib>
-// #include "omp.h"
 using namespace std;
 using namespace chrono;
-
-// 编译指令如下
-// g++ main.cpp train.cpp guessing.cpp md5.cpp -o main
-// g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O1
-// g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2
-// g++ main.cpp train.cpp guessing.cpp md5.cpp -o main -O2 -fopenmp
 
 int main(int argc, char **argv)
 { 
@@ -73,7 +66,6 @@ int main(int argc, char **argv)
     auto start = system_clock::now();
     // 由于需要定期清空内存，我们在这里记录已生成的猜测总数
     int history = 0;
-    // std::ofstream a("./files/results.txt");
 
     while (!q.priority.empty())
     {
@@ -81,7 +73,6 @@ int main(int argc, char **argv)
         q.total_guesses = q.guesses.size();
         if (q.total_guesses - curr_num >= 100000)
         {
-            // cout << "Guesses generated: " <<history + q.total_guesses << endl;
             curr_num = q.total_guesses;
 
             // 在此处更改实验生成的猜测上限
@@ -93,42 +84,37 @@ int main(int argc, char **argv)
                 cout << "Guess time:" << time_guess - time_hash << "seconds"<< endl;//请不要修改这一行
                 cout << "Hash time:" << time_hash << "seconds"<<endl;//请不要修改这一行
                 cout << "Train time:" << time_train <<"seconds"<<endl;//请不要修改这一行
-                // cout << "PriorityQueue::Generate中，进入多线程分支 " << q.pthread_count << "次"<<endl;
-                // cout << "进入单线程分支" << q.serial_count << "次"<<endl;
                 break;
             }
         }
-        // 为了避免内存超限，我们在q.guesses中口令达到一定数目时，将其中的所有口令取出并且进行哈希
-        // 然后，q.guesses将会被清空。为了有效记录已经生成的口令总数，维护一个history变量来进行记录
-        // if (q.guesses.size() >= 8) 发现性能没有提升，可能是条件过于苛刻，导致没有进入分支，我们修改进入分支的条件，只要基类够8个就执行
+        // 当累计达到一定数量时，批量进行MD5哈希（GPU加速）
         if (curr_num > 500000) 
         {
             auto start_hash = system_clock::now();
-            bit32 state_batch[4][4];
-            int count = 0;
-            string input_arry[4];
-            for(string pw : q.guesses)
+
+            int n = q.guesses.size();
+            bit32* results = new bit32[n * 4];
+
+            // 使用GPU批量哈希（自动跳过>55字符的口令，这类口令极罕见）
+            int gpu_done = MD5HashBatch_GPU(q.guesses.data(), n, results);
+
+            // CPU fallback: 处理被GPU跳过的超长口令
+            if (gpu_done < n)
             {
-                input_arry[count++] = pw;
-                if (count == 4){
-                    MD5HashBatch(input_arry, state_batch);
-                    count = 0;
-                }
-            }
-            // 处理剩余不足4个的口令（用标量版本完成）
-            if (count > 0)
-            {
-                for (int i = 0; i < count; ++i)
+                for (int i = 0; i < n; ++i)
                 {
-                    bit32 state[4];
-                    MD5Hash(input_arry[i], state); // 调用原始的标量 MD5Hash
+                    if (q.guesses[i].length() > 55)
+                    {
+                        MD5Hash(q.guesses[i], results + i * 4);
+                    }
                 }
             }
 
-            // 在这里对哈希所需的总时长进行计算
             auto end_hash = system_clock::now();
             auto duration = duration_cast<microseconds>(end_hash - start_hash);
             time_hash += double(duration.count()) * microseconds::period::num / microseconds::period::den;
+
+            delete[] results;
 
             // 记录已经生成的口令总数
             history += curr_num;
