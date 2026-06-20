@@ -6,8 +6,9 @@ using namespace std;
 
 #define GPU_MAXLEN 64
 #define GPU_THRESHOLD 4096
+#define BATCH_FLUSH_SIZE 131072   // flush when accumulated total_items exceeds this
 
-// ==== GPU Generate kernels ====================================================
+// ==== GPU Generate kernels (per-item, used by batch) ==========================
 __global__ void GenerateKernel_Single(
     const char* values, const int* val_lens,
     char* out_passwords, int* out_lengths,
@@ -41,230 +42,197 @@ __global__ void GenerateKernel_Multi(
     out_lengths[tid] = total;
 }
 
-// ==== GPU cache for segment ordered_values ====================================
-struct GPUSegmentCache {
-    char* d_values = nullptr;
-    int*  d_val_lens = nullptr;
-    int   max_vallen = 0;
-};
-
-// Key: address of segment (since segments are in model.m.letters/digits/symbols vectors, stable)
+// ==== Segment cache (one-time H2D per segment) ================================
+struct GPUSegmentCache { char* d_values = nullptr; int* d_val_lens = nullptr; int max_vallen = 0; };
 static unordered_map<segment*, GPUSegmentCache> g_seg_cache;
 
-// Persistent GPU output buffer (reused across Generate calls)
-static char* d_out_buf = nullptr;
-static int*  d_out_lens_buf = nullptr;
-static int   out_buf_cap = 0;
+// ==== Multi-PT batch accumulator =============================================
+struct PTBatch {
+    string prefix;          // "" for single-segment
+    segment* a;             // last segment
+    int total_items;
+    int guesses_base;       // where in guesses vector output starts
+};
+static vector<PTBatch> g_pt_batch;
+static int g_batch_total = 0;  // sum of total_items in batch
 
-static void EnsureOutBuf(int needed) {
-    if (needed <= out_buf_cap) return;
-    if (d_out_buf) cudaFree(d_out_buf);
-    if (d_out_lens_buf) cudaFree(d_out_lens_buf);
-    int alloc = needed + 65536;
-    cudaMalloc(&d_out_buf, alloc * GPU_MAXLEN);
-    cudaMalloc(&d_out_lens_buf, alloc * sizeof(int));
-    out_buf_cap = alloc;
+// Ensure all segments in batch are uploaded to GPU
+static void PreUploadSegments() {
+    for (auto& e : g_pt_batch) {
+        GetOrUploadSegment(e.a);
+    }
 }
 
 static GPUSegmentCache& GetOrUploadSegment(segment* a) {
     auto it = g_seg_cache.find(a);
     if (it != g_seg_cache.end()) return it->second;
-
-    // Upload ordered_values to GPU
     GPUSegmentCache c;
     int n = a->ordered_values.size();
-    c.max_vallen = 0;
-    for (int i = 0; i < n; ++i)
-        if ((int)a->ordered_values[i].length() > c.max_vallen)
-            c.max_vallen = a->ordered_values[i].length();
+    for (int i = 0; i < n; ++i) if ((int)a->ordered_values[i].length() > c.max_vallen) c.max_vallen = a->ordered_values[i].length();
     if (c.max_vallen > 55) c.max_vallen = 55;
-
-    char* h_vals = new char[n * c.max_vallen];
-    int*  h_lens = new int[n];
+    char* h_vals = new char[n * c.max_vallen]; int* h_lens = new int[n];
     memset(h_vals, 0, n * c.max_vallen);
-    for (int i = 0; i < n; ++i) {
-        int len = min((int)a->ordered_values[i].length(), c.max_vallen);
-        memcpy(h_vals + i * c.max_vallen, a->ordered_values[i].c_str(), len);
-        h_lens[i] = len;
-    }
-    cudaMalloc(&c.d_values, n * c.max_vallen);
-    cudaMalloc(&c.d_val_lens, n * sizeof(int));
+    for (int i = 0; i < n; ++i) { int len = min((int)a->ordered_values[i].length(), c.max_vallen); memcpy(h_vals + i * c.max_vallen, a->ordered_values[i].c_str(), len); h_lens[i] = len; }
+    cudaMalloc(&c.d_values, n * c.max_vallen); cudaMalloc(&c.d_val_lens, n * sizeof(int));
     cudaMemcpy(c.d_values, h_vals, n * c.max_vallen, cudaMemcpyHostToDevice);
     cudaMemcpy(c.d_val_lens, h_lens, n * sizeof(int), cudaMemcpyHostToDevice);
     delete[] h_vals; delete[] h_lens;
-
     g_seg_cache[a] = c;
     return g_seg_cache[a];
 }
 
-// ==== GPU Generate wrappers (bulk D2H) ========================================
-static void Generate_GPU_Single(segment* a, int total_items,
-                                 vector<string>& guesses, int old_size)
-{
-    GPUSegmentCache& c = GetOrUploadSegment(a);
-    EnsureOutBuf(total_items);
-
-    int block = 256, grid = (total_items + block - 1) / block;
-    GenerateKernel_Single<<<grid, block>>>(c.d_values, c.d_val_lens,
-        d_out_buf, d_out_lens_buf, total_items, c.max_vallen);
-    cudaDeviceSynchronize();
-
-    char* h_out = new char[total_items * GPU_MAXLEN];
-    int*  h_out_lens = new int[total_items];
-    cudaMemcpy(h_out, d_out_buf, total_items * GPU_MAXLEN, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_out_lens, d_out_lens_buf, total_items * sizeof(int), cudaMemcpyDeviceToHost);
-
-    guesses.resize(old_size + total_items);
-    for (int i = 0; i < total_items; ++i)
-        guesses[old_size + i] = string(h_out + i * GPU_MAXLEN, h_out_lens[i]);
-    delete[] h_out; delete[] h_out_lens;
+// GPU output buffer (reused)
+static char* d_out = nullptr; static int* d_out_lens = nullptr; static int out_cap = 0;
+static void EnsureOutBuf(int n) {
+    if (n <= out_cap) return;
+    if (d_out) { cudaFree(d_out); cudaFree(d_out_lens); }
+    out_cap = n + 65536;
+    cudaMalloc(&d_out, out_cap * GPU_MAXLEN);
+    cudaMalloc(&d_out_lens, out_cap * sizeof(int));
 }
 
-static void Generate_GPU_Multi(const string& prefix, segment* a, int total_items,
-                                vector<string>& guesses, int old_size)
-{
-    GPUSegmentCache& c = GetOrUploadSegment(a);
-    EnsureOutBuf(total_items);
+// Bulk D2H: copy GPU output → CPU guesses at specified offsets
+static void BulkD2H_MultiPT(vector<string>& guesses) {
+    int total = g_batch_total;
+    if (total == 0) return;
+    char* h_out = new char[total * GPU_MAXLEN];
+    int*  h_lens = new int[total];
+    cudaMemcpy(h_out, d_out, total * GPU_MAXLEN, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_lens, d_out_lens, total * sizeof(int), cudaMemcpyDeviceToHost);
 
-    int prefix_len = prefix.length();
-    char* d_prefix; cudaMalloc(&d_prefix, prefix_len);
-    cudaMemcpy(d_prefix, prefix.c_str(), prefix_len, cudaMemcpyHostToDevice);
+    int gpu_offset = 0;
+    for (auto& e : g_pt_batch) {
+        for (int i = 0; i < e.total_items; ++i) {
+            guesses[e.guesses_base + i] = string(h_out + (gpu_offset + i) * GPU_MAXLEN, h_lens[gpu_offset + i]);
+        }
+        gpu_offset += e.total_items;
+    }
+    delete[] h_out; delete[] h_lens;
+}
 
-    int block = 256, grid = (total_items + block - 1) / block;
-    GenerateKernel_Multi<<<grid, block>>>(d_prefix, prefix_len,
-        c.d_values, c.d_val_lens, d_out_buf, d_out_lens_buf, total_items, c.max_vallen);
-    cudaDeviceSynchronize();
-    cudaFree(d_prefix);
+// Flush accumulated PT batch to GPU
+void FlushGPUBatch(vector<string>& guesses) {
+    if (g_pt_batch.empty()) return;
 
-    char* h_out = new char[total_items * GPU_MAXLEN];
-    int*  h_out_lens = new int[total_items];
-    cudaMemcpy(h_out, d_out_buf, total_items * GPU_MAXLEN, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_out_lens, d_out_lens_buf, total_items * sizeof(int), cudaMemcpyDeviceToHost);
+    PreUploadSegments();
+    int total = g_batch_total;
+    EnsureOutBuf(total);
 
-    guesses.resize(old_size + total_items);
-    for (int i = 0; i < total_items; ++i)
-        guesses[old_size + i] = string(h_out + i * GPU_MAXLEN, h_out_lens[i]);
-    delete[] h_out; delete[] h_out_lens;
+    int gpu_offset = 0;
+    for (auto& e : g_pt_batch) {
+        GPUSegmentCache& c = g_seg_cache[e.a];
+        int block = 256, grid = (e.total_items + block - 1) / block;
+
+        if (e.prefix.empty()) {
+            // Single-segment PT
+            GenerateKernel_Single<<<grid, block>>>(
+                c.d_values, c.d_val_lens,
+                d_out + gpu_offset * GPU_MAXLEN,
+                d_out_lens + gpu_offset,
+                e.total_items, c.max_vallen);
+        } else {
+            // Multi-segment PT
+            int plen = e.prefix.length();
+            char* d_prefix; cudaMalloc(&d_prefix, plen);
+            cudaMemcpy(d_prefix, e.prefix.c_str(), plen, cudaMemcpyHostToDevice);
+            GenerateKernel_Multi<<<grid, block>>>(
+                d_prefix, plen,
+                c.d_values, c.d_val_lens,
+                d_out + gpu_offset * GPU_MAXLEN,
+                d_out_lens + gpu_offset,
+                e.total_items, c.max_vallen);
+            cudaFree(d_prefix);
+        }
+        gpu_offset += e.total_items;
+    }
+    cudaDeviceSynchronize();  // single sync for entire batch
+
+    // Single bulk D2H
+    BulkD2H_MultiPT(guesses);
+
+    g_pt_batch.clear();
+    g_batch_total = 0;
+}
+
+// Expose for main.cpp
+extern "C" void FlushGPUBatch_C() {
+    // Will be called with PriorityQueue's guesses
+    // declared in PCGF.h
 }
 
 // ==== PriorityQueue methods ===================================================
-void PriorityQueue::CalProb(PT &pt)
-{
-    pt.prob = pt.preterm_prob;
-    int index = 0;
+void PriorityQueue::CalProb(PT &pt) {
+    pt.prob = pt.preterm_prob; int index = 0;
     for (int idx : pt.curr_indices) {
-        if (pt.content[index].type == 1) {
-            pt.prob *= m.letters[m.FindLetter(pt.content[index])].ordered_freqs[idx];
-            pt.prob /= m.letters[m.FindLetter(pt.content[index])].total_freq;
-        }
-        if (pt.content[index].type == 2) {
-            pt.prob *= m.digits[m.FindDigit(pt.content[index])].ordered_freqs[idx];
-            pt.prob /= m.digits[m.FindDigit(pt.content[index])].total_freq;
-        }
-        if (pt.content[index].type == 3) {
-            pt.prob *= m.symbols[m.FindSymbol(pt.content[index])].ordered_freqs[idx];
-            pt.prob /= m.symbols[m.FindSymbol(pt.content[index])].total_freq;
-        }
+        if (pt.content[index].type == 1) { pt.prob *= m.letters[m.FindLetter(pt.content[index])].ordered_freqs[idx]; pt.prob /= m.letters[m.FindLetter(pt.content[index])].total_freq; }
+        else if (pt.content[index].type == 2) { pt.prob *= m.digits[m.FindDigit(pt.content[index])].ordered_freqs[idx]; pt.prob /= m.digits[m.FindDigit(pt.content[index])].total_freq; }
+        else if (pt.content[index].type == 3) { pt.prob *= m.symbols[m.FindSymbol(pt.content[index])].ordered_freqs[idx]; pt.prob /= m.symbols[m.FindSymbol(pt.content[index])].total_freq; }
         index += 1;
     }
 }
-
-void PriorityQueue::init()
-{
+void PriorityQueue::init() {
     for (PT pt : m.ordered_pts) {
         for (segment seg : pt.content) {
             if (seg.type == 1) pt.max_indices.emplace_back(m.letters[m.FindLetter(seg)].ordered_values.size());
             if (seg.type == 2) pt.max_indices.emplace_back(m.digits[m.FindDigit(seg)].ordered_values.size());
             if (seg.type == 3) pt.max_indices.emplace_back(m.symbols[m.FindSymbol(seg)].ordered_values.size());
         }
-        pt.preterm_prob = float(m.preterm_freq[m.FindPT(pt)]) / m.total_preterm;
-        CalProb(pt);
-        priority.emplace_back(pt);
+        pt.preterm_prob = float(m.preterm_freq[m.FindPT(pt)]) / m.total_preterm; CalProb(pt); priority.emplace_back(pt);
     }
 }
-
-void PriorityQueue::PopNext()
-{
+void PriorityQueue::PopNext() {
     Generate(priority.front());
     vector<PT> new_pts = priority.front().NewPTs();
     for (PT pt : new_pts) {
         CalProb(pt);
         for (auto iter = priority.begin(); iter != priority.end(); iter++) {
-            if (iter != priority.end() - 1 && iter != priority.begin()) {
-                if (pt.prob <= iter->prob && pt.prob > (iter + 1)->prob) {
-                    priority.emplace(iter + 1, pt); break;
-                }
-            }
+            if (iter != priority.end() - 1 && iter != priority.begin()) { if (pt.prob <= iter->prob && pt.prob > (iter + 1)->prob) { priority.emplace(iter + 1, pt); break; } }
             if (iter == priority.end() - 1) { priority.emplace_back(pt); break; }
             if (iter == priority.begin() && iter->prob < pt.prob) { priority.emplace(iter, pt); break; }
         }
     }
     priority.erase(priority.begin());
 }
-
-vector<PT> PT::NewPTs()
-{
-    vector<PT> res;
-    if (content.size() == 1) return res;
+vector<PT> PT::NewPTs() {
+    vector<PT> res; if (content.size() == 1) return res;
     int init_pivot = pivot;
-    for (int i = pivot; i < curr_indices.size() - 1; i += 1) {
-        curr_indices[i] += 1;
-        if (curr_indices[i] < max_indices[i]) { pivot = i; res.emplace_back(*this); }
-        curr_indices[i] -= 1;
-    }
-    pivot = init_pivot;
-    return res;
+    for (int i = pivot; i < curr_indices.size() - 1; i += 1) { curr_indices[i] += 1; if (curr_indices[i] < max_indices[i]) { pivot = i; res.emplace_back(*this); } curr_indices[i] -= 1; }
+    pivot = init_pivot; return res;
 }
 
-// ==== Generate: GPU-accelerated with segment cache + reusable output buffer ===
-void PriorityQueue::Generate(PT pt)
-{
+// ==== Generate: CPU (small) or batch-queue GPU (large) ========================
+void PriorityQueue::Generate(PT pt) {
     CalProb(pt);
-
-    if (pt.content.size() == 1)
-    {
+    if (pt.content.size() == 1) {
         segment *a;
-        if (pt.content[0].type == 1)      a = &m.letters[m.FindLetter(pt.content[0])];
-        if (pt.content[0].type == 2)      a = &m.digits[m.FindDigit(pt.content[0])];
-        if (pt.content[0].type == 3)      a = &m.symbols[m.FindSymbol(pt.content[0])];
-
-        int total_items = pt.max_indices[0];
-        old_size = guesses.size();
-
-        if (total_items > GPU_THRESHOLD) {
-            Generate_GPU_Single(a, total_items, guesses, old_size);
-        } else {
-            guesses.resize(old_size + total_items);
-            for (int i = 0; i < total_items; i += 1)
-                guesses[old_size + i] = a->ordered_values[i];
-        }
-    }
-    else
-    {
-        string prefix;
-        int seg_idx = 0;
+        if (pt.content[0].type == 1) a = &m.letters[m.FindLetter(pt.content[0])];
+        if (pt.content[0].type == 2) a = &m.digits[m.FindDigit(pt.content[0])];
+        if (pt.content[0].type == 3) a = &m.symbols[m.FindSymbol(pt.content[0])];
+        int n = pt.max_indices[0]; old_size = guesses.size();
+        if (n > GPU_THRESHOLD) {
+            guesses.resize(old_size + n);
+            PTBatch e; e.prefix = ""; e.a = a; e.total_items = n; e.guesses_base = old_size;
+            g_pt_batch.push_back(e); g_batch_total += n;
+            if (g_batch_total >= BATCH_FLUSH_SIZE) FlushGPUBatch(guesses);
+        } else { guesses.resize(old_size + n); for (int i = 0; i < n; ++i) guesses[old_size + i] = a->ordered_values[i]; }
+    } else {
+        string pre; int s = 0;
         for (int idx : pt.curr_indices) {
-            if (pt.content[seg_idx].type == 1)      prefix += m.letters[m.FindLetter(pt.content[seg_idx])].ordered_values[idx];
-            if (pt.content[seg_idx].type == 2)      prefix += m.digits[m.FindDigit(pt.content[seg_idx])].ordered_values[idx];
-            if (pt.content[seg_idx].type == 3)      prefix += m.symbols[m.FindSymbol(pt.content[seg_idx])].ordered_values[idx];
-            seg_idx += 1;
-            if (seg_idx == pt.content.size() - 1) break;
+            if (pt.content[s].type == 1) pre += m.letters[m.FindLetter(pt.content[s])].ordered_values[idx];
+            if (pt.content[s].type == 2) pre += m.digits[m.FindDigit(pt.content[s])].ordered_values[idx];
+            if (pt.content[s].type == 3) pre += m.symbols[m.FindSymbol(pt.content[s])].ordered_values[idx];
+            s++; if (s == pt.content.size() - 1) break;
         }
-
         segment *a;
-        if (pt.content[pt.content.size() - 1].type == 1) a = &m.letters[m.FindLetter(pt.content[pt.content.size() - 1])];
-        if (pt.content[pt.content.size() - 1].type == 2) a = &m.digits[m.FindDigit(pt.content[pt.content.size() - 1])];
-        if (pt.content[pt.content.size() - 1].type == 3) a = &m.symbols[m.FindSymbol(pt.content[pt.content.size() - 1])];
-
-        int total_items = pt.max_indices[pt.content.size() - 1];
-        old_size = guesses.size();
-
-        if (total_items > GPU_THRESHOLD) {
-            Generate_GPU_Multi(prefix, a, total_items, guesses, old_size);
-        } else {
-            guesses.resize(old_size + total_items);
-            for (int i = 0; i < total_items; i += 1)
-                guesses[old_size + i] = prefix + a->ordered_values[i];
-        }
+        if (pt.content[pt.content.size()-1].type == 1) a = &m.letters[m.FindLetter(pt.content[pt.content.size()-1])];
+        if (pt.content[pt.content.size()-1].type == 2) a = &m.digits[m.FindDigit(pt.content[pt.content.size()-1])];
+        if (pt.content[pt.content.size()-1].type == 3) a = &m.symbols[m.FindSymbol(pt.content[pt.content.size()-1])];
+        int n = pt.max_indices[pt.content.size()-1]; old_size = guesses.size();
+        if (n > GPU_THRESHOLD) {
+            guesses.resize(old_size + n);
+            PTBatch e; e.prefix = pre; e.a = a; e.total_items = n; e.guesses_base = old_size;
+            g_pt_batch.push_back(e); g_batch_total += n;
+            if (g_batch_total >= BATCH_FLUSH_SIZE) FlushGPUBatch(guesses);
+        } else { guesses.resize(old_size + n); for (int i = 0; i < n; ++i) guesses[old_size + i] = pre + a->ordered_values[i]; }
     }
 }
