@@ -104,18 +104,20 @@ struct PendingGPUBatch
 {
     vector<PTBatch> entries;
     vector<char*> d_prefixes;
-    char* h_out = nullptr;
-    int* h_lens = nullptr;
     int total = 0;
-    cudaStream_t stream = nullptr;
     bool active = false;
 };
 
 static PendingGPUBatch g_pending_batch;
+static cudaStream_t g_gpu_stream = nullptr;
+static char* h_out = nullptr;
+static int* h_lens = nullptr;
+static int host_out_cap = 0;
 
 static GPUSegmentCache& GetOrUploadSegment(segment* a);
 static void SubmitGPUBatchAsync(vector<string>& guesses);
 static void WaitPendingGPUBatch(vector<string>& guesses);
+static void EnsureHostOutBuf(int n);
 
 void ConfigureGPUGenerate(int gpu_threshold, int batch_flush_size)
 {
@@ -232,12 +234,28 @@ static void FillGuessesFromPending(vector<string>& guesses)
     for (auto& e : g_pending_batch.entries) {
         for (int i = 0; i < e.total_items; ++i) {
             guesses[e.guesses_base + i] = string(
-                g_pending_batch.h_out + (gpu_offset + i) * GPU_MAXLEN,
-                g_pending_batch.h_lens[gpu_offset + i]);
+                h_out + (gpu_offset + i) * GPU_MAXLEN,
+                h_lens[gpu_offset + i]);
         }
 
         gpu_offset += e.total_items;
     }
+}
+
+static void EnsureHostOutBuf(int n)
+{
+    if (n <= host_out_cap) {
+        return;
+    }
+
+    if (h_out) {
+        cudaFreeHost(h_out);
+        cudaFreeHost(h_lens);
+    }
+
+    host_out_cap = n + 65536;
+    cudaMallocHost(&h_out, host_out_cap * GPU_MAXLEN);
+    cudaMallocHost(&h_lens, host_out_cap * sizeof(int));
 }
 
 // 将累计的多个 PT 异步提交给 GPU。CPU 可继续生成后续小 PT，直到下一次显式等待。
@@ -252,16 +270,17 @@ static void SubmitGPUBatchAsync(vector<string>& guesses)
     PreUploadSegments();
     int total = g_batch_total;
     EnsureOutBuf(total);
+    EnsureHostOutBuf(total);
+
+    if (g_gpu_stream == nullptr) {
+        cudaStreamCreate(&g_gpu_stream);
+    }
 
     g_pending_batch.entries = g_pt_batch;
     g_pending_batch.total = total;
     g_pending_batch.active = true;
     g_pending_batch.d_prefixes.clear();
     g_pending_batch.d_prefixes.reserve(g_pending_batch.entries.size());
-
-    cudaStreamCreate(&g_pending_batch.stream);
-    cudaMallocHost(&g_pending_batch.h_out, total * GPU_MAXLEN);
-    cudaMallocHost(&g_pending_batch.h_lens, total * sizeof(int));
 
     int gpu_offset = 0;
     for (auto& e : g_pending_batch.entries) {
@@ -271,7 +290,7 @@ static void SubmitGPUBatchAsync(vector<string>& guesses)
 
         if (e.prefix.empty()) {
             // 单段 PT 无需前缀，直接把 segment 的每个 value 写入输出缓冲区。
-            GenerateKernel_Single<<<grid, block, 0, g_pending_batch.stream>>>(
+            GenerateKernel_Single<<<grid, block, 0, g_gpu_stream>>>(
                 c.d_values, c.d_val_lens,
                 d_out + gpu_offset * GPU_MAXLEN,
                 d_out_lens + gpu_offset,
@@ -283,9 +302,9 @@ static void SubmitGPUBatchAsync(vector<string>& guesses)
             char* d_prefix = nullptr;
 
             cudaMalloc(&d_prefix, plen);
-            cudaMemcpyAsync(d_prefix, e.prefix.c_str(), plen, cudaMemcpyHostToDevice, g_pending_batch.stream);
+            cudaMemcpyAsync(d_prefix, e.prefix.c_str(), plen, cudaMemcpyHostToDevice, g_gpu_stream);
 
-            GenerateKernel_Multi<<<grid, block, 0, g_pending_batch.stream>>>(
+            GenerateKernel_Multi<<<grid, block, 0, g_gpu_stream>>>(
                 d_prefix, plen,
                 c.d_values, c.d_val_lens,
                 d_out + gpu_offset * GPU_MAXLEN,
@@ -298,8 +317,8 @@ static void SubmitGPUBatchAsync(vector<string>& guesses)
         gpu_offset += e.total_items;
     }
 
-    cudaMemcpyAsync(g_pending_batch.h_out, d_out, total * GPU_MAXLEN, cudaMemcpyDeviceToHost, g_pending_batch.stream);
-    cudaMemcpyAsync(g_pending_batch.h_lens, d_out_lens, total * sizeof(int), cudaMemcpyDeviceToHost, g_pending_batch.stream);
+    cudaMemcpyAsync(h_out, d_out, total * GPU_MAXLEN, cudaMemcpyDeviceToHost, g_gpu_stream);
+    cudaMemcpyAsync(h_lens, d_out_lens, total * sizeof(int), cudaMemcpyDeviceToHost, g_gpu_stream);
 
     g_async_flush_count += 1;
     g_flush_count += 1;
@@ -314,7 +333,7 @@ static void WaitPendingGPUBatch(vector<string>& guesses)
     }
 
     auto t_wait = steady_clock::now();
-    cudaStreamSynchronize(g_pending_batch.stream);
+    cudaStreamSynchronize(g_gpu_stream);
     g_gpu_wait_time += double(duration_cast<microseconds>(steady_clock::now() - t_wait).count()) * 1e-6;
 
     FillGuessesFromPending(guesses);
@@ -324,10 +343,6 @@ static void WaitPendingGPUBatch(vector<string>& guesses)
             cudaFree(d_prefix);
         }
     }
-
-    cudaFreeHost(g_pending_batch.h_out);
-    cudaFreeHost(g_pending_batch.h_lens);
-    cudaStreamDestroy(g_pending_batch.stream);
 
     g_pending_batch = PendingGPUBatch();
 }
