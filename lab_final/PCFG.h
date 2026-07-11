@@ -96,12 +96,15 @@ public:
 // Multi-PT GPU batch flush (from guessing.cu)
 extern void FlushGPUBatch(vector<string>& guesses);
 
-// GPU 生成阶段的运行参数与统计信息。
-// 本阶段只做 GPU 进阶任务，不在 CPU 小任务上引入线程或进程并行。
+// GPU/CPU 生成阶段的运行参数与统计信息。
 struct GPUGenerateStats
 {
     long long gpu_items = 0;
     long long cpu_items = 0;
+    long long cpu_threaded_items = 0;
+    long long cpu_serial_items = 0;
+    long long cpu_threaded_pt_count = 0;
+    long long cpu_serial_pt_count = 0;
     long long flush_count = 0;
     long long async_flush_count = 0;
     long long cached_segments = 0;

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <omp.h>
 #include <unordered_map>
 using namespace std;
 using namespace chrono;
@@ -14,8 +15,13 @@ static int g_gpu_threshold = 4096;
 static int g_batch_flush_size = 131072;
 static int g_dynamic_gpu_threshold = 4096;
 static int g_adaptive_batch_target = 131072;
+static const int CPU_OMP_THRESHOLD = 2048;
 static long long g_gpu_items = 0;
 static long long g_cpu_items = 0;
+static long long g_cpu_threaded_items = 0;
+static long long g_cpu_serial_items = 0;
+static long long g_cpu_threaded_pt_count = 0;
+static long long g_cpu_serial_pt_count = 0;
 static long long g_flush_count = 0;
 static long long g_async_flush_count = 0;
 static long long g_submitted_gpu_items = 0;
@@ -169,6 +175,10 @@ GPUGenerateStats GetGPUGenerateStats()
     GPUGenerateStats stats;
     stats.gpu_items = g_gpu_items;
     stats.cpu_items = g_cpu_items;
+    stats.cpu_threaded_items = g_cpu_threaded_items;
+    stats.cpu_serial_items = g_cpu_serial_items;
+    stats.cpu_threaded_pt_count = g_cpu_threaded_pt_count;
+    stats.cpu_serial_pt_count = g_cpu_serial_pt_count;
     stats.flush_count = g_flush_count;
     stats.async_flush_count = g_async_flush_count;
     stats.cached_segments = static_cast<long long>(g_seg_cache.size());
@@ -352,19 +362,43 @@ static bool ShouldFlushBatch(int next_pt_items, bool large_pt, bool *idle_flush,
 static void GenerateOnCPU(vector<string> &guesses, int guesses_base, const string &prefix, segment *a, int n)
 {
     auto t_cpu = steady_clock::now();
-    if (prefix.empty())
+    if (n >= CPU_OMP_THRESHOLD)
     {
+#pragma omp parallel for schedule(static)
         for (int i = 0; i < n; ++i)
         {
-            guesses[guesses_base + i] = a->ordered_values[i];
+            if (prefix.empty())
+            {
+                guesses[guesses_base + i] = a->ordered_values[i];
+            }
+            else
+            {
+                guesses[guesses_base + i] = prefix + a->ordered_values[i];
+            }
         }
+
+        g_cpu_threaded_items += n;
+        g_cpu_threaded_pt_count += 1;
     }
     else
     {
-        for (int i = 0; i < n; ++i)
+        if (prefix.empty())
         {
-            guesses[guesses_base + i] = prefix + a->ordered_values[i];
+            for (int i = 0; i < n; ++i)
+            {
+                guesses[guesses_base + i] = a->ordered_values[i];
+            }
         }
+        else
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                guesses[guesses_base + i] = prefix + a->ordered_values[i];
+            }
+        }
+
+        g_cpu_serial_items += n;
+        g_cpu_serial_pt_count += 1;
     }
 
     g_cpu_generate_time += double(duration_cast<microseconds>(steady_clock::now() - t_cpu).count()) * 1e-6;

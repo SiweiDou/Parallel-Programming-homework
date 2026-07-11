@@ -136,7 +136,11 @@ int main(int argc, char **argv)
     GPUGenerateStats stats = GetGPUGenerateStats();
 
     cout << "GPU generate items:" << stats.gpu_items << endl;
-    cout << "CPU serial generate items:" << stats.cpu_items << endl;
+    cout << "CPU generate items:" << stats.cpu_items << endl;
+    cout << "CPU OpenMP generate items:" << stats.cpu_threaded_items << endl;
+    cout << "CPU serial generate items:" << stats.cpu_serial_items << endl;
+    cout << "CPU OpenMP PT count:" << stats.cpu_threaded_pt_count << endl;
+    cout << "CPU serial PT count:" << stats.cpu_serial_pt_count << endl;
     cout << "GPU batch flush count:" << stats.flush_count << endl;
     cout << "GPU async flush count:" << stats.async_flush_count << endl;
     cout << "Adaptive flush count:" << stats.adaptive_flush_count << endl;
