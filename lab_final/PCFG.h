@@ -105,10 +105,23 @@ struct GPUGenerateStats
     long long flush_count = 0;
     long long async_flush_count = 0;
     long long cached_segments = 0;
+    long long small_pt_count = 0;
+    long long medium_pt_count = 0;
+    long long large_pt_count = 0;
+    long long adaptive_flush_count = 0;
+    long long idle_flush_count = 0;
+    long long max_pt_flush_count = 0;
     double gpu_wait_time = 0;
+    double gpu_stream_time = 0;
+    double cpu_generate_time = 0;
+    double avg_batch_items = 0;
+    double cpu_items_per_sec = 0;
+    double gpu_items_per_sec = 0;
     int overlap_enabled = 0;
     int gpu_threshold = 4096;
     int batch_flush_size = 131072;
+    int dynamic_gpu_threshold = 4096;
+    int adaptive_batch_target = 131072;
 };
 
 extern void ConfigureGPUGenerate(int gpu_threshold, int batch_flush_size);

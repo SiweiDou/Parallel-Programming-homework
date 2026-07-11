@@ -139,11 +139,24 @@ int main(int argc, char **argv)
     cout << "CPU serial generate items:" << stats.cpu_items << endl;
     cout << "GPU batch flush count:" << stats.flush_count << endl;
     cout << "GPU async flush count:" << stats.async_flush_count << endl;
+    cout << "Adaptive flush count:" << stats.adaptive_flush_count << endl;
+    cout << "Idle GPU early flush count:" << stats.idle_flush_count << endl;
+    cout << "Max PT-count flush count:" << stats.max_pt_flush_count << endl;
     cout << "GPU wait time:" << stats.gpu_wait_time << "seconds" << endl;
+    cout << "GPU submit stream time:" << stats.gpu_stream_time << "seconds" << endl;
+    cout << "CPU generate time:" << stats.cpu_generate_time << "seconds" << endl;
     cout << "CPU/GPU overlap enabled:" << stats.overlap_enabled << endl;
     cout << "Cached GPU segments:" << stats.cached_segments << endl;
     cout << "Effective GPU threshold:" << stats.gpu_threshold << endl;
     cout << "Effective batch flush size:" << stats.batch_flush_size << endl;
+    cout << "Dynamic GPU threshold:" << stats.dynamic_gpu_threshold << endl;
+    cout << "Adaptive batch target:" << stats.adaptive_batch_target << endl;
+    cout << "Average GPU batch items:" << stats.avg_batch_items << endl;
+    cout << "CPU generate throughput:" << stats.cpu_items_per_sec << "items/s" << endl;
+    cout << "GPU submit throughput:" << stats.gpu_items_per_sec << "items/s" << endl;
+    cout << "Small PT count:" << stats.small_pt_count << endl;
+    cout << "Medium PT count:" << stats.medium_pt_count << endl;
+    cout << "Large PT count:" << stats.large_pt_count << endl;
 
     return 0;
 }
