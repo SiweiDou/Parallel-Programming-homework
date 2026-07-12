@@ -38,6 +38,7 @@ static void MergeSegmentStats(segment &dst, const segment &src)
         }
         else
         {
+            // 全局 segment 中已有该取值，直接把局部频率累加过去。
             int dst_id = dst.values[value];
             dst.freqs[dst_id] += freq;
         }
@@ -163,6 +164,7 @@ void model::train(string path)
     // 因而不需要在 parse 内部加锁，也避免了哈希表频繁加锁带来的额外开销。
     #pragma omp parallel
     {
+        // 每个线程维护一个局部模型，parse 时只写本线程对象，不需要锁。
         int tid = omp_get_thread_num();
         #pragma omp for schedule(static)
         for (int i = 0; i < passwords.size(); i += 1)
@@ -181,12 +183,15 @@ void model::train(string path)
 /// @brief 在模型中找到一个PT的统计数据
 /// @param pt 需要查找的PT
 /// @return 目标PT在模型中的对应下标
+// 在线性表中查找是否已有完全相同的 PT 模板。
+// 判断标准是段数相同，且每一段 type 和 length 都相同。
 int model::FindPT(PT pt)
 {
     for (int id = 0; id < preterminals.size(); id += 1)
     {
         if (preterminals[id].content.size() != pt.content.size())
         {
+            // 段数不同不可能是同一个模板，直接跳过。
             continue;
         }
         else
@@ -212,6 +217,7 @@ int model::FindPT(PT pt)
 /// @brief 在模型中找到一个letter segment的统计数据
 /// @param seg 要找的letter segment
 /// @return 目标letter segment的对应下标
+// 查找字母 segment。这里只比较 length，因为调用方已经保证 type 是字母。
 int model::FindLetter(segment seg)
 {
     for (int id = 0; id < letters.size(); id += 1)
@@ -227,6 +233,7 @@ int model::FindLetter(segment seg)
 /// @brief 在模型中找到一个digit segment的统计数据
 /// @param seg 要找的digit segment
 /// @return 目标digit segment的对应下标
+// 查找数字 segment。这里只比较 length，因为调用方已经保证 type 是数字。
 int model::FindDigit(segment seg)
 {
     for (int id = 0; id < digits.size(); id += 1)
@@ -239,6 +246,7 @@ int model::FindDigit(segment seg)
     return -1;
 }
 
+// 查找符号 segment。这里只比较 length，因为调用方已经保证 type 是符号。
 int model::FindSymbol(segment seg)
 {
     for (int id = 0; id < symbols.size(); id += 1)
@@ -251,25 +259,32 @@ int model::FindSymbol(segment seg)
     return -1;
 }
 
+// 向 PT 模板追加一个 segment，同时初始化该段当前下标为 0。
 void PT::insert(segment seg)
 {
     content.emplace_back(seg);
 }
 
+// 向当前 segment 的统计表中插入一个具体取值。
+// 训练阶段每遇到一次相同类型/长度的字符段，就调用一次该函数更新频率。
 void segment::insert(string value)
 {
     if (values.find(value) == values.end())
     {
+        // 第一次遇到该取值：为它分配内部编号，并把频率初始化为 1。
         values[value] = values.size();
         freqs[values[value]] = 1;
     }
     else
     {
+        // 已存在的取值只需要增加频率，编号保持不变。
         freqs[values[value]] += 1;
     }
 }
 
 
+// 将无序哈希表中的取值按频率降序转为顺序数组。
+// 生成阶段依赖 ordered_values[0]、ordered_values[1] ... 先枚举高概率候选。
 void segment::order()
 {
     for (pair<string, int> value : values)
@@ -296,6 +311,8 @@ void segment::order()
     }
 }
 
+// 将一条训练口令解析为 PCFG 模板，并更新各类统计。
+// 字符类型切换时，先把上一段提交到 letters/digits/symbols，再开始新段。
 void model::parse(string pw)
 {
     PT pt;
@@ -305,10 +322,13 @@ void model::parse(string pw)
     // 相信我，以后你会用上的。You're welcome :)
     for (char ch : pw)
     {
+        // 逐字符扫描，curr_type 表示当前正在累积的段类型，curr_part 保存该段内容。
         if (isalpha(ch))
         {
+            // 当前字符是字母：若上一段不是字母，则需要先提交上一段再开启新的字母段。
             if (curr_type != 1)
             {
+                // 从数字/符号切换到字母，需要根据上一段类型提交 curr_part。
                 if (curr_type == 2)
                 {
                     segment seg(curr_type, curr_part.length());
@@ -353,8 +373,10 @@ void model::parse(string pw)
         }
         else if (isdigit(ch))
         {
+            // 当前字符是数字：若上一段不是数字，则先提交上一段再开启新的数字段。
             if (curr_type != 2)
             {
+                // 从字母/符号切换到数字，需要根据上一段类型提交 curr_part。
                 if (curr_type == 1)
                 {
                     segment seg(curr_type, curr_part.length());
@@ -401,6 +423,7 @@ void model::parse(string pw)
         {
             if (curr_type != 3)
             {
+                // 从字母/数字切换到符号，需要根据上一段类型提交 curr_part。
                 if (curr_type == 1)
                 {
                     segment seg(curr_type, curr_part.length());
@@ -446,6 +469,7 @@ void model::parse(string pw)
     }
     if (!curr_part.empty())
     {
+        // 扫描结束后还有最后一段尚未提交，需要根据 curr_type 做收尾处理。
         if (curr_type == 1)
         {
             segment seg(curr_type, curr_part.length());
@@ -510,6 +534,7 @@ void model::parse(string pw)
     total_preterm += 1;
     if (FindPT(pt) == -1)
     {
+        // 新 PT 模板：初始化每个段的 curr_indices 为 0，并记录频率 1。
         for (int i = 0; i < pt.content.size(); i += 1)
         {
             pt.curr_indices.emplace_back(0);
@@ -521,12 +546,14 @@ void model::parse(string pw)
     }
     else
     {
+        // 已存在 PT 模板：只增加模板频率。
         int id = FindPT(pt);
         // cout << id << endl;
         preterm_freq[id] += 1;
     }
 }
 
+// 按 PCFG 记号打印单个 segment，例如 L6、D2、S1。
 void segment::PrintSeg()
 {
     if (type == 1)
@@ -543,6 +570,7 @@ void segment::PrintSeg()
     }
 }
 
+// 打印当前 segment 的候选取值及频率，用于检查训练结果。
 void segment::PrintValues()
 {
     // order();
@@ -552,6 +580,7 @@ void segment::PrintValues()
     }
 }
 
+// 连续打印 PT 中的所有 segment，形成完整模板字符串。
 void PT::PrintPT()
 {
     for (auto iter : content)
@@ -560,6 +589,7 @@ void PT::PrintPT()
     }
 }
 
+// 打印模型中 PT 和 segment 的频率统计，主要用于调试。
 void model::print()
 {
     cout << "preterminals:" << endl;
@@ -601,10 +631,13 @@ void model::print()
     }
 }
 
+// PT 排序比较函数：先验概率高的模板排在前面，优先被生成。
 bool compareByPretermProb(const PT& a, const PT& b) {
     return a.preterm_prob > b.preterm_prob;  // 降序排序
 }
 
+// 训练结束后的排序阶段：
+// 1. 计算并排序 PT 先验概率；2. 对 L/D/S 各类 segment 内部取值按频率排序。
 void model::order()
 {
     cout << "Training phase 2: Ordering segment values and PTs..." << endl;
