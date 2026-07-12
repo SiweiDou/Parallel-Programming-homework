@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cctype>
 #include <algorithm>
+#include <omp.h>
 
 // 这个文件里面的各函数你都不需要完全理解，甚至根本不需要看
 // 从学术价值上讲，加速模型的训练过程是一个没什么价值的问题，因为我们一般假定统计学模型的训练成本较低
@@ -18,11 +19,121 @@
  * 
  */
 
+// 将一个局部 segment 的统计结果合并到全局 segment 中。
+// 并行训练采用“每个线程独立训练一个局部模型，最后再串行归并”的方式，
+// 这样可以避免多个线程同时写 unordered_map/vector 造成数据竞争。
+static void MergeSegmentStats(segment &dst, const segment &src)
+{
+    for (const auto &kv : src.values)
+    {
+        const string &value = kv.first;
+        int src_id = kv.second;
+        int freq = src.freqs.at(src_id);
+
+        if (dst.values.find(value) == dst.values.end())
+        {
+            int new_id = dst.values.size();
+            dst.values[value] = new_id;
+            dst.freqs[new_id] = freq;
+        }
+        else
+        {
+            int dst_id = dst.values[value];
+            dst.freqs[dst_id] += freq;
+        }
+    }
+}
+
+// 按 segment 类型和长度把局部模型中的 letters/digits/symbols 合并回全局模型。
+// 这里复用原来的 FindLetter/FindDigit/FindSymbol 和 GetNext*ID 接口，
+// 保证最终数据结构仍然符合后续 order()/Generate() 的预期。
+static void MergeSegmentVector(model &global_model,
+                               const vector<segment> &local_segments,
+                               const unordered_map<int, int> &local_freqs,
+                               int seg_type)
+{
+    for (int i = 0; i < local_segments.size(); i += 1)
+    {
+        const segment &src = local_segments[i];
+        segment key(src.type, src.length);
+        int dst_id = -1;
+
+        if (seg_type == 1)
+        {
+            dst_id = global_model.FindLetter(key);
+            if (dst_id == -1)
+            {
+                dst_id = global_model.GetNextLettersID();
+                global_model.letters.emplace_back(key);
+                global_model.letters_freq[dst_id] = 0;
+            }
+            global_model.letters_freq[dst_id] += local_freqs.at(i);
+            MergeSegmentStats(global_model.letters[dst_id], src);
+        }
+        else if (seg_type == 2)
+        {
+            dst_id = global_model.FindDigit(key);
+            if (dst_id == -1)
+            {
+                dst_id = global_model.GetNextDigitsID();
+                global_model.digits.emplace_back(key);
+                global_model.digits_freq[dst_id] = 0;
+            }
+            global_model.digits_freq[dst_id] += local_freqs.at(i);
+            MergeSegmentStats(global_model.digits[dst_id], src);
+        }
+        else
+        {
+            dst_id = global_model.FindSymbol(key);
+            if (dst_id == -1)
+            {
+                dst_id = global_model.GetNextSymbolsID();
+                global_model.symbols.emplace_back(key);
+                global_model.symbols_freq[dst_id] = 0;
+            }
+            global_model.symbols_freq[dst_id] += local_freqs.at(i);
+            MergeSegmentStats(global_model.symbols[dst_id], src);
+        }
+    }
+}
+
+// 将一个线程训练出的局部 PCFG 模型归并到全局模型。
+// PCFG 的统计量本质上是可加的：局部 PT 频率、segment 频率和总样本数相加后，
+// 得到的模型应与串行逐行 parse 的统计结果一致。
+static void MergeLocalModel(model &global_model, const model &local_model)
+{
+    global_model.total_preterm += local_model.total_preterm;
+
+    MergeSegmentVector(global_model, local_model.letters, local_model.letters_freq, 1);
+    MergeSegmentVector(global_model, local_model.digits, local_model.digits_freq, 2);
+    MergeSegmentVector(global_model, local_model.symbols, local_model.symbols_freq, 3);
+
+    for (int i = 0; i < local_model.preterminals.size(); i += 1)
+    {
+        PT pt = local_model.preterminals[i];
+        int dst_id = global_model.FindPT(pt);
+
+        if (dst_id == -1)
+        {
+            // 局部模型中的 PT 已经由 parse() 初始化过 curr_indices。
+            // 归并时直接复制即可，不能再次追加，否则 curr_indices 长度会超过 PT 段数，
+            // 后续优先队列展开 NewPTs()/Generate() 时会读到错误的状态。
+            dst_id = global_model.GetNextPretermID();
+            global_model.preterminals.emplace_back(pt);
+            global_model.preterm_freq[dst_id] = 0;
+        }
+
+        global_model.preterm_freq[dst_id] += local_model.preterm_freq.at(i);
+    }
+}
+
 // 训练的wrapper，实际上就是读取训练集
 void model::train(string path)
 {
     string pw;
     ifstream train_set(path);
+    vector<string> passwords;
+    passwords.reserve(3000000);
     int lines = 0;
     cout<<"Training..."<<endl;
     cout<<"Training phase 1: reading and parsing passwords..."<<endl;
@@ -38,8 +149,32 @@ void model::train(string path)
                 break;
             }
         }
-        // 读取单个口令之后，就可以将其扔进parse函数进行PT/segment的分割、识别、统计了
-        parse(pw);
+        passwords.emplace_back(pw);
+    }
+
+    int train_threads = omp_get_max_threads();
+    cout << "Training input lines: " << passwords.size() << endl;
+    cout << "OpenMP train threads: " << train_threads << endl;
+
+    vector<model> local_models(train_threads);
+
+    // 读取单个口令之后，就可以将其扔进parse函数进行PT/segment的分割、识别、统计了
+    // 并行版本中每个线程只写自己的 local_models[tid]，不共享修改全局模型，
+    // 因而不需要在 parse 内部加锁，也避免了哈希表频繁加锁带来的额外开销。
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        #pragma omp for schedule(static)
+        for (int i = 0; i < passwords.size(); i += 1)
+        {
+            local_models[tid].parse(passwords[i]);
+        }
+    }
+
+    cout << "Training phase 1b: merging local OpenMP models..." << endl;
+    for (int i = 0; i < train_threads; i += 1)
+    {
+        MergeLocalModel(*this, local_models[i]);
     }
 }
 
