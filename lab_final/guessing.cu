@@ -731,7 +731,18 @@ void PriorityQueue::init()
 
 void PriorityQueue::PopNext()
 {
-    Generate(priority.front());
+    PopNext(true);
+}
+
+// MPI 融合版本要求所有 rank 以完全相同的顺序推进优先队列，
+// 但只有被分配到当前 PT 的 rank 真正生成候选口令。
+void PriorityQueue::PopNext(bool do_generate)
+{
+    if (do_generate)
+    {
+        Generate(priority.front());
+    }
+
     vector<PT> new_pts = priority.front().NewPTs();
     for (PT pt : new_pts)
     {
@@ -792,6 +803,8 @@ vector<PT> PT::NewPTs()
 }
 
 // ==== Generate: CPU (small) or batch-queue GPU (large) ========================
+// 每次 Generate 只展开当前 PT 的最后一个 segment。短 PT/小规模展开留给 CPU，
+// 其中超过 CPU_OMP_THRESHOLD 的部分走 OpenMP；大规模规则化枚举进入 GPU batch。
 void PriorityQueue::Generate(PT pt)
 {
     CalProb(pt);

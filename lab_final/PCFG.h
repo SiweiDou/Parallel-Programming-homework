@@ -88,6 +88,7 @@ public:
     void init();
     void Generate(PT pt);
     void PopNext();
+    void PopNext(bool do_generate);
     int total_guesses = 0;
     int old_size = 0;
     vector<string> guesses;
